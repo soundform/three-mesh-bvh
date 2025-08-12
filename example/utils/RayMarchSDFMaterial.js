@@ -9,6 +9,7 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 			defines: {
 
 				MAX_STEPS: 500,
+        SHOW_STEPS: 0,
 				SURFACE_EPSILON: 0.001,
 
 			},
@@ -96,9 +97,10 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 						bool intersectsSurface = false;
 						vec4 localPoint = vec4( sdfRayOrigin + sdfRayDirection * ( distToBox + 1e-5 ), 1.0 );
 						vec4 point = sdfTransform * localPoint;
+            int i = 0;
 
 						// ray march
-						for ( int i = 0; i < MAX_STEPS; i ++ ) {
+						for ( i = 0; i < MAX_STEPS; i ++ ) {
 
 							// sdf box extends from - 0.5 to 0.5
 							// transform into the local bounds space [ 0, 1 ] and check if we're inside the bounds
@@ -141,6 +143,10 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 								0.1;
 							gl_FragColor.rgb = vec3( lightIntensity );
 							gl_FragColor.a = 1.0;
+
+              #if SHOW_STEPS
+              gl_FragColor.rgb = float(i)/float(MAX_STEPS)*vec3(4,2,1);
+              #endif
 
 						}
 
