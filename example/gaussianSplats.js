@@ -4,16 +4,16 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { CopyShader } from 'three/examples/jsm/shaders/CopyShader.js';
 import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
 import Stats from 'stats.js';
-import { GenerateSDFMaterial } from './utils/GenerateSDFMaterial.js';
 import { RenderSDFLayerMaterial } from './utils/RenderSDFLayerMaterial.js';
-import { RayMarchSDFMaterial } from './utils/RayMarchSDFMaterial.js';
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import {
   MeshBVHHelper, MeshBVH,
   computeBoundsTree, disposeBoundsTree,
-  SAH, CENTER, AVERAGE
+  SAH, CENTER, AVERAGE,
+  BVHShaderGLSL,
+  MeshBVHUniformStruct
 } from 'three-mesh-bvh';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -27,7 +27,6 @@ const params = {
   mode: 'raymarching',
   surface: 0.01,
   maxSteps: 100,
-  showSteps: false,
   displayHelper: true,
   helperDepth: 10,
   displayParents: false,
@@ -43,8 +42,224 @@ const inverseBoundsMatrix = new THREE.Matrix4();
 const plyPath = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
 const glbPath = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
 
-init();
-render();
+class GenerateSDFMaterial2 extends THREE.ShaderMaterial {
+
+  constructor(params) {
+
+    super({
+
+      uniforms: {
+
+        inverseBoundsMatrix: { value: new THREE.Matrix4() },
+        zValue: { value: 0 },
+        bvh: { value: new MeshBVHUniformStruct() }
+
+      },
+
+      vertexShader: /* glsl */`
+
+        varying vec2 vUv;
+
+        void main() {
+
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+
+        }
+
+      `,
+
+      fragmentShader: /* glsl */`
+
+        precision highp isampler2D;
+        precision highp usampler2D;
+
+        ${BVHShaderGLSL.common_functions}
+        ${BVHShaderGLSL.bvh_struct_definitions}
+        ${BVHShaderGLSL.bvh_raymarch_functions}
+
+        varying vec2 vUv;
+
+        uniform BVH bvh;
+        uniform float zValue;
+        uniform mat4 inverseBoundsMatrix;
+
+        void main() {
+          vec3 uvz = vec3( vUv, zValue );
+          vec3 point = ( inverse(inverseBoundsMatrix) * vec4(uvz - 0.5, 1) ).xyz;
+          float dist = bvhClosestPointToPoint( bvh, point, 1e6 );
+          gl_FragColor = vec4( dist, 0, 0, 0 );
+
+        }
+
+      `
+
+    });
+
+    this.setValues(params);
+
+  }
+
+}
+
+class RayMarchSDFMaterial2 extends THREE.ShaderMaterial {
+
+  constructor(params) {
+
+    super({
+
+      defines: {
+
+        MAX_STEPS: 500,
+        SURFACE_EPSILON: 0.001,
+
+      },
+
+      uniforms: {
+
+        surface: { value: 0 },
+        bvh: { value: new MeshBVHUniformStruct() },
+        sdfTex: { value: null },
+        inverseBoundsMatrix: { value: new THREE.Matrix4() },
+        projectionInverse: { value: new THREE.Matrix4() },
+        sdfTransformInverse: { value: new THREE.Matrix4() }
+
+      },
+
+      vertexShader: /* glsl */`
+
+        varying vec2 vUv;
+
+        void main() {
+
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+
+        }
+
+      `,
+
+      fragmentShader: /* glsl */`
+        precision highp sampler3D;
+
+        varying vec2 vUv;
+
+        ${BVHShaderGLSL.common_functions}
+        ${BVHShaderGLSL.bvh_struct_definitions}
+        ${BVHShaderGLSL.bvh_raymarch_functions}
+
+        uniform float surface;
+        uniform BVH bvh;
+        uniform sampler3D sdfTex;
+        uniform mat4 projectionInverse;
+        uniform mat4 sdfTransformInverse;
+        uniform mat4 inverseBoundsMatrix;
+
+        #include <common>
+
+        // distance to box bounds
+        vec2 rayBoxDist( vec3 boundsMin, vec3 boundsMax, vec3 rayOrigin, vec3 rayDir ) {
+
+          vec3 t0 = ( boundsMin - rayOrigin ) / rayDir;
+          vec3 t1 = ( boundsMax - rayOrigin ) / rayDir;
+          vec3 tmin = min( t0, t1 );
+          vec3 tmax = max( t0, t1 );
+
+          float distA = max( max( tmin.x, tmin.y ), tmin.z );
+          float distB = min( tmax.x, min( tmax.y, tmax.z ) );
+
+          float distToBox = max( 0.0, distA );
+          float distInsideBox = max( 0.0, distB - distToBox );
+          return vec2( distToBox, distInsideBox );
+
+        }
+
+        void main() {
+
+          // get the inverse of the sdf box transform
+          mat4 sdfTransform = inverse( sdfTransformInverse );
+
+          // convert the uv to clip space for ray transformation
+          vec2 clipSpace = 2.0 * vUv - vec2( 1.0 );
+
+          // get world ray direction
+          vec3 rayOrigin = vec3( 0.0 );
+          vec4 homogenousDirection = projectionInverse * vec4( clipSpace, - 1.0, 1.0 );
+          vec3 rayDirection = normalize( homogenousDirection.xyz / homogenousDirection.w );
+
+          // transform ray into local coordinates of sdf bounds
+          vec3 sdfRayOrigin = ( sdfTransformInverse * vec4( rayOrigin, 1.0 ) ).xyz;
+          vec3 sdfRayDirection = normalize( ( sdfTransformInverse * vec4( rayDirection, 0.0 ) ).xyz );
+
+          // find whether our ray hits the box bounds in the local box space
+          vec2 boxIntersectionInfo = rayBoxDist( vec3( - 0.5 ), vec3( 0.5 ), sdfRayOrigin, sdfRayDirection );
+          float distToBox = boxIntersectionInfo.x;
+          float distInsideBox = boxIntersectionInfo.y;
+          vec3 sdfDims = vec3(textureSize(sdfTex, 0));
+          float cost = 0.;
+
+          gl_FragColor = vec4( 0.0 );
+
+          if ( distInsideBox > 0.0 ) {
+
+            // find the surface point in world space
+            bool intersectsSurface = false;
+            vec4 localPoint = vec4( sdfRayOrigin + sdfRayDirection * ( distToBox + 1e-5 ), 1.0 );
+            vec4 point = sdfTransform * localPoint;
+
+            // ray march
+            for ( int i = 0; i < MAX_STEPS; i ++ ) {
+
+              cost += 0.01;
+
+              // sdf box extends from - 0.5 to 0.5
+              // transform into the local bounds space [ 0, 1 ] and check if we're inside the bounds
+              vec3 uv = ( sdfTransformInverse * point ).xyz + 0.5;
+              if (clamp(uv, 0., 1.) != uv) break;
+
+              vec4 pt3d = inverse(inverseBoundsMatrix)*vec4(uv - 0.5, 1);
+              vec4 pt3d2 = inverse(inverseBoundsMatrix)*vec4(uv - 0.5 + 1.0/sdfDims, 1);
+              float distRange = length(pt3d - pt3d2);
+              
+              //float approxDist = texture(sdfTex, uv).x;
+              float approxDist = texelFetch(sdfTex, ivec3(uv*sdfDims), 0).x;
+              
+              //float maxDist = approxDist + distRange*0.5;
+              //float exactDist = bvhClosestPointToPoint(bvh, pt3d.xyz, maxDist);
+              //if (abs(approxDist - exactDist) > distRange*0.5) {
+              //  gl_FragColor = vec4(0,1,0,1);
+              //  return;
+              //}
+
+              float dist = approxDist - surface;
+
+              if ( dist < SURFACE_EPSILON ) {
+                intersectsSurface = true;
+                break;
+              }
+
+              point.xyz += rayDirection * abs(dist);
+            }
+
+            if ( intersectsSurface ) {
+              gl_FragColor.a = 1.0;
+              gl_FragColor.rgb = cost*vec3(9,3,1);
+            }
+
+          }
+
+          //#include <colorspace_fragment>
+
+        }
+      `
+
+    });
+
+    this.setValues(params);
+
+  }
+
+}
 
 async function init() {
   outputContainer = document.getElementById('output');
@@ -74,7 +289,7 @@ async function init() {
   document.body.appendChild(stats.dom);
 
   // sdf pass to generate the 3d texture
-  generateSdfPass = new FullScreenQuad(new GenerateSDFMaterial());
+  generateSdfPass = new FullScreenQuad(new GenerateSDFMaterial2());
 
   // screen pass to render a single layer of the 3d texture
   layerPass = new FullScreenQuad(new RenderSDFLayerMaterial());
@@ -82,7 +297,7 @@ async function init() {
   layerPass.material.needsUpdate = true;
 
   // screen pass to render the sdf ray marching
-  raymarchPass = new FullScreenQuad(new RayMarchSDFMaterial());
+  raymarchPass = new FullScreenQuad(new RayMarchSDFMaterial2());
   raymarchPass.material.defines.MAX_STEPS = params.maxSteps;
   raymarchPass.material.needsUpdate = true;
 
@@ -100,18 +315,22 @@ async function init() {
 
 }
 
-async function initGeometry() {
+async function loadGeometry() {
   console.time('loadGeometry');
+  //let geometry = await new PLYLoader().loadAsync(plyPath);
   let gltf = await new GLTFLoader()
     .setMeshoptDecoder(MeshoptDecoder)
     .loadAsync(glbPath);
   gltf.scene.updateMatrixWorld(true);
   let gltfMesh = gltf.scene.children[0];
   let geometry = gltfMesh.geometry;
-  //let geometry = await new PLYLoader().loadAsync(plyPath);
-  console.timeEnd('loadGeometry');
-
   geometry.center();
+  console.timeEnd('loadGeometry');
+  return geometry;
+}
+
+async function initGeometry() {
+  const geometry = await loadGeometry();
   const material = new THREE.PointsMaterial({ size: params.pointSize, vertexColors: true });
   pointCloud = new THREE.Points(geometry, material);
   pointCloud.name = 'Point Cloud';
@@ -126,6 +345,7 @@ async function initGeometry() {
   bvhGeometry.setIndex(index);
   bvhGeometry.setAttribute('position', position);
   bvhGeometry.computeBoundsTree({ strategy: params.strategy });
+  console.log('Geometry size:', index.length/3, 'points');
 
   bvhMesh = new THREE.Mesh(bvhGeometry, new THREE.MeshBasicMaterial({ color: 0xff0000 }));
   bvhHelper = new MeshBVHHelper(bvhMesh, params.depth);
@@ -137,13 +357,7 @@ async function initGeometry() {
 
 // build the gui with parameters based on the selected display mode
 function rebuildGUI() {
-
-  if (gui) {
-
-    gui.destroy();
-
-  }
-
+  gui?.destroy();
   gui = new GUI();
 
   const generationFolder = gui.addFolder('generation');
@@ -191,10 +405,6 @@ function rebuildGUI() {
       raymarchPass.material.defines.MAX_STEPS = parseInt(v);
       raymarchPass.material.needsUpdate = true;
     });
-    displayFolder.add(params, 'showSteps').onChange(v => {
-      raymarchPass.material.defines.SHOW_STEPS = v ? 1 : 0;
-      raymarchPass.material.needsUpdate = true;
-    });
   }
 
 }
@@ -236,7 +446,7 @@ function updateSDF() {
   renderer.initRenderTarget(rtSDF);
 
   generateSdfPass.material.uniforms.bvh.value.updateFrom(bvh);
-  generateSdfPass.material.uniforms.matrix.value.copy(matrix);
+  generateSdfPass.material.uniforms.inverseBoundsMatrix.value.copy(inverseBoundsMatrix);
 
   const scratchTarget = new THREE.WebGLRenderTarget(size3d, size3d);
   scratchTarget.texture.format = THREE.RedFormat;
@@ -313,10 +523,10 @@ function render() {
     camera.updateMatrixWorld();
     pointCloud.updateMatrixWorld();
 
-    const { width, depth, height } = rtSDF.texture.image;
+    raymarchPass.material.uniforms.bvh.value.updateFrom(bvh);
     raymarchPass.material.uniforms.sdfTex.value = rtSDF.texture;
-    raymarchPass.material.uniforms.normalStep.value.set(1 / width, 1 / height, 1 / depth);
     raymarchPass.material.uniforms.surface.value = params.surface;
+    raymarchPass.material.uniforms.inverseBoundsMatrix.value.copy(inverseBoundsMatrix);
     raymarchPass.material.uniforms.projectionInverse.value.copy(camera.projectionMatrixInverse);
     raymarchPass.material.uniforms.sdfTransformInverse.value.copy(pointCloud.matrixWorld)
       .invert().premultiply(inverseBoundsMatrix).multiply(camera.matrixWorld);
@@ -324,3 +534,6 @@ function render() {
 
   }
 }
+
+init();
+render();
