@@ -7,7 +7,7 @@ export const common_functions = /* glsl */`
 // However not all trees are balanced. Best value to set this to
 // is the trees max depth.
 #ifndef BVH_STACK_DEPTH
-#define BVH_STACK_DEPTH 60
+#define BVH_STACK_DEPTH 32
 #endif
 
 #ifndef INFINITY

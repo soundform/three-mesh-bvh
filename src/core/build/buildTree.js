@@ -6,7 +6,7 @@ import { BYTES_PER_NODE } from '../Constants.js';
 
 import { partition } from './sortUtils.generated.js';
 import { partition_indirect } from './sortUtils_indirect.generated.js';
-import { countNodes, populateBuffer } from './buildUtils.js';
+import { countDepth, countNodes, populateBuffer } from './buildUtils.js';
 
 export function generateIndirectBuffer( geometry, useSharedArrayBuffer ) {
 
@@ -41,6 +41,8 @@ export function buildTree( bvh, triangleBounds, offset, count, options ) {
 	const geometry = bvh.geometry;
 	const indexArray = geometry.index ? geometry.index.array : null;
 	const partionFunc = indirect ? partition_indirect : partition;
+
+  //debugger;
 
 	// generate intermediate variables
 	const totalTriangles = getTriCount( geometry );
@@ -170,6 +172,7 @@ export function buildPackedTree( bvh, options ) {
 
 		const root = buildTree( bvh, triangleBounds, range.offset, range.count, options );
 		const nodeCount = countNodes( root );
+    const treeDepth = countDepth( root );
 		const buffer = new BufferConstructor( BYTES_PER_NODE * nodeCount );
 		populateBuffer( 0, root, buffer );
 		return buffer;
