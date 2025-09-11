@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>three-mesh-bvh - Gaussian Splats</title>
+    <title>three-mesh-bvh - Gaussian Splats Raymarching</title>
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 
     <style type="text/css">
@@ -43,7 +43,7 @@
 </head>
 <body>
 	<div id="info">
-		3D Texture <a href="https://en.wikipedia.org/wiki/Signed_distance_function">Signed Distance Field</a> generation on the gpu and raymarching.
+		Raymarching accelerated by a 3D texture of <a href="https://en.wikipedia.org/wiki/Signed_distance_function">SDF</a> values and <a href="https://en.wikipedia.org/wiki/Jump_flooding_algorithm">JFA</a> to skip empty regions.
 		<br/>
 		"Surface" sets the distance at which the surface is rendered.
 		<br/>
@@ -51,6 +51,6 @@
 
 	</div>
 	<div id="output"></div>
-    <script type="module" src="./gaussianSplats.js"></script>
+    <script type="module" src="./gaussianSplatsRaymarching.js"></script>
 </body>
 </html>

@@ -37,8 +37,8 @@ let outputContainer, bvh, rtSDF, rtJFA, rtSDFandJFA;
 let bvhMesh, bvhHelper, pointCloud;
 let sdfVoxelsPass, copyPass, previewPass, jfaPass, combinePass, raymarchPass;
 const boundsMatrix = new THREE.Matrix4();
-const plyPath = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
-const glbPath = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
+//const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
+const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
 
 class SDFVoxelsPass extends THREE.ShaderMaterial {
 
@@ -509,15 +509,19 @@ async function init() {
 
 async function loadGeometry() {
   console.time('loadGeometry');
+  console.log('Loading scene:', sceneFile);
+  let geometry;
 
-  //let geometry = await new PLYLoader().loadAsync(plyPath);
-
-  let gltf = await new GLTFLoader()
-    .setMeshoptDecoder(MeshoptDecoder)
-    .loadAsync(glbPath);
-  gltf.scene.updateMatrixWorld(true);
-  let gltfMesh = gltf.scene.children[0];
-  let geometry = gltfMesh.geometry;
+  if (sceneFile.endsWith('.ply')) {
+    geometry = await new PLYLoader().loadAsync(sceneFile);
+  } else {
+    let gltf = await new GLTFLoader()
+      .setMeshoptDecoder(MeshoptDecoder)
+      .loadAsync(sceneFile);
+    gltf.scene.updateMatrixWorld(true);
+    let gltfMesh = gltf.scene.children[0];
+    geometry = gltfMesh.geometry;
+  }
 
   geometry.center();
   console.timeEnd('loadGeometry');
@@ -536,7 +540,7 @@ async function initGeometry() {
   const position = geometry.attributes.position;
   const index = [];
   for (let i = 0; i < position.count; i++)
-    if (i % 2 == 0) index.push(i, i, i);
+    if (i % 1 == 0) index.push(i, i, i);
   bvhGeometry.setIndex(index);
   bvhGeometry.setAttribute('position', position);
   bvhGeometry.computeBoundsTree(getBVHOptions());
