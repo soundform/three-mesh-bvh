@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>three-mesh-bvh - Gaussian Splats Raytracing</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+
+    <style type="text/css">
+        html, body {
+            padding: 0;
+            margin: 0;
+            overflow: hidden;
+			font-family: monospace;
+			background-color: #000000;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+		#output {
+			color: #ffffff;
+			position: absolute;
+			left: 10px;
+			bottom: 10px;
+			white-space: pre;
+		}
+
+		#info {
+			position: absolute;
+			top: 0;
+			width: 100%;
+			color: white;
+			font-family: monospace;
+			text-align: center;
+			padding: 5px 0;
+		}
+
+		a {
+			color: white;
+		}
+    </style>
+</head>
+<body>
+	<div id="info">
+		Gaussian splats raytracing.<br>
+    Each ray finds the nearest 8 splats and blends them.<br>
+    Each pixel casts 1-4 such rays, so at most 32 splats are blended.
+	</div>
+	<div id="output"></div>
+    <script type="module" src="./gaussianSplatsRaytracing.js"></script>
+</body>
+</html>
