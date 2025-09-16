@@ -25,7 +25,7 @@ const params = {
   maxLeafTris: 8,
   sparsity: 0,
   splatSize: 0.005,
-  splatOpacity: -1, // exp2
+  splatOpacity: 0, // exp2
   maxRaycasts: 1,
   maxSplatsPerRay: 8,
   showCost: false,
@@ -35,12 +35,66 @@ const getBVHOptions = () => ({ strategy: params.strategy, maxLeafTris: params.ma
 
 let renderer, camera, scene, gui, stats, outputContainer;
 let bvh, bvhMesh, bvhHelper, pointCloud;
-let raytracingPass, drawPixelsPass;
-let renderTargets = [];
+let raytracingPass, drawPixelsPass, shadowsPass;
+let renderTargets = [], shadowsRT;
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
 const sceneFile = 'models/bunny.glb';
 //const sceneFile = 'models/sportcar.ply';
+
+THREE.ShaderChunk['raycast_splats'] = /* glsl */`
+  #ifndef SHOW_COST
+  #define SHOW_COST 0
+  #endif
+
+  #ifndef USE_SHADOWS
+  #define USE_SHADOWS 0
+  #endif
+
+  float raycastSplats(vec3 ro, vec3 rd, inout vec4 rgba) {
+    BVHIntersectResult res;
+    bvhIntersectSplats( bvh, ro, rd, splatSize, res );
+
+    #if SHOW_COST
+      
+      vec4 cost = vec4(res.numLookupsBVH, res.numLookupsSplats, res.numSplats, 0)/1e3;
+
+      // rgba.zw are reserved for raytracing metadata
+      cost.xy += unpackUnorm2x16(floatBitsToUint(rgba.x));
+      cost.zw += unpackUnorm2x16(floatBitsToUint(rgba.y));
+
+      rgba.x = uintBitsToFloat(packUnorm2x16(cost.xy));
+      rgba.y = uintBitsToFloat(packUnorm2x16(cost.zw));
+
+    #else
+
+      // blend all splats along the ray
+      for (int i = 0; i < res.numSplats; i++) {
+        uint splatId = gSplatIds[i];
+        vec3 pos = texelFetch1D( bvh.position, splatId ).xyz;
+        vec3 d = (ro + rd*gSplatDists[i] - pos)/splatSize*3.0;
+        float density = exp(-0.5 * dot(d, d));
+        
+        vec4 color = vec4(1,0,0,density);
+        color.a *= splatOpacity;
+
+        #if USE_SHADOWS
+        color.rgb *= texelFetch1D(shadowsData, splatId).x;
+        #endif
+
+        // standard blending
+        color.rgb *= color.a;
+        rgba += color * (1. - rgba.a);
+        if (rgba.a > 0.995) return INFINITY;
+      }
+
+    #endif
+    
+    if (res.numSplats < MAX_SPLATS_PER_RAY)
+      return INFINITY;
+    return gSplatDists[res.numSplats - 1];
+  }
+`;
 
 class RaytracingMaterial extends THREE.ShaderMaterial {
 
@@ -58,6 +112,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
       defines: {
 
         SHOW_COST: 0,
+        USE_SHADOWS: 1,
         MAX_RAYCASTS: 1,
         MAX_SPLATS_PER_RAY: 1,
 
@@ -74,6 +129,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
         modelMatrix: { value: new THREE.Matrix4() },
 
         pixelData: { value: null },
+        shadowsData: { value: null },
 
       },
 
@@ -104,50 +160,10 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
         uniform mat4 projectionMatrix;
         uniform mat4 modelMatrix;
         uniform sampler2D pixelData;
+        uniform sampler2D shadowsData;
 
         #include <common>
-
-        vec3 hash33(vec3 p3) {
-          p3 = fract(p3 * vec3(.1031, .1030, .0973));
-          p3 += dot(p3, p3.yxz+33.33);
-          return fract((p3.xxy + p3.yxx)*p3.zyx);
-        }
-
-        float raycast(vec3 ro, vec3 rd, inout vec4 rgba) {
-          BVHIntersectResult res;
-          bvhIntersectSplats( bvh, ro, rd, splatSize, res );
-
-          #if SHOW_COST
-            
-            vec4 cost = vec4(res.numLookupsBVH, res.numLookupsSplats, res.numSplats, 0)/1e3;
-
-            // rgba.zw are reserved for raytracing metadata
-            cost.xy += unpackUnorm2x16(floatBitsToUint(rgba.x));
-            cost.zw += unpackUnorm2x16(floatBitsToUint(rgba.y));
-
-            rgba.x = uintBitsToFloat(packUnorm2x16(cost.xy));
-            rgba.y = uintBitsToFloat(packUnorm2x16(cost.zw));
-
-          #else
-
-            // blend all splats along the ray
-            for (int i = 0; i < res.numSplats; i++) {
-
-              vec3 pos = texelFetch1D( bvh.position, gSplatIds[i] ).xyz;
-              vec3 dir = ro + rd*gSplatDists[i] - pos;
-              float d = length(dir)/splatSize*3.0;
-              float density = splatOpacity*exp(-d*d*0.5);
-              vec3 color = vec3(1,0,0); // luminance
-              rgba += vec4(color, 1) * density * (1. - rgba.a);
-              if (rgba.a > 0.995) return INFINITY;
-            }
-
-          #endif
-          
-          if (res.numSplats < MAX_SPLATS_PER_RAY)
-            return INFINITY;
-          return gSplatDists[res.numSplats - 1];
-        }
+        #include <raycast_splats>
 
         void main() {
           vec2 ndc = vUv*2. - 1.;
@@ -161,16 +177,104 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
           gl_FragColor = texelFetch(pixelData, ivec2(vUv*size), 0);
           
           if (gl_FragColor.z >= INFINITY) return;
-          rayOrigin += gl_FragColor.z*rayDirection;
+          rayOrigin += gl_FragColor.z * rayDirection;
 
           for (int step = 0; step < MAX_RAYCASTS; step++) {
-            float d = raycast(rayOrigin, rayDirection, gl_FragColor);
+            float d = raycastSplats(rayOrigin, rayDirection, gl_FragColor);
             // beware of float32 accuracy
             d += max(d/1e6, splatSize/1e4);
             gl_FragColor.z += d;
             if (d >= INFINITY) break;
             rayOrigin += d*rayDirection;
           }
+        }`
+    });
+
+    this.setValues(params);
+  }
+}
+
+class ComputeShadowsMaterial extends THREE.ShaderMaterial {
+
+  constructor(params) {
+
+    super({
+
+      defines: {
+
+        USE_SHADOWS: 0,
+        MAX_SPLATS_PER_RAY: 32,
+
+      },
+
+      uniforms: {
+
+        splatsCount: { value: 0 },
+        renderSize: { value: [0, 0] },
+
+        shadowsData: { value: null },
+
+        splatSize: { value: 0 },
+        splatOpacity: { value: 0 },
+        bvh: { value: new MeshBVHUniformStruct() },
+
+        cameraWorldMatrix: { value: new THREE.Matrix4() },
+        projectionMatrix: { value: new THREE.Matrix4() },
+        modelMatrix: { value: new THREE.Matrix4() },
+
+      },
+
+      vertexShader: /* glsl */`
+
+        out vec2 vUv;
+
+        void main() {
+
+          vUv = uv;
+          gl_Position = vec4( position, 1.0 );
+
+        }
+
+      `,
+
+      fragmentShader: /* glsl */`
+        in vec2 vUv;
+
+        ${BVHShaderGLSL.common_functions}
+        ${BVHShaderGLSL.bvh_struct_definitions}
+        ${BVHShaderGLSL.bvh_gsplat_ray_functions}
+
+        uniform int splatsCount;
+        uniform ivec2 renderSize;
+        uniform sampler2D shadowsData;
+
+        uniform BVH bvh;
+        uniform float splatSize;
+        uniform float splatOpacity;
+        uniform mat4 cameraWorldMatrix;
+        uniform mat4 projectionMatrix;
+        uniform mat4 modelMatrix;
+
+        #include <common>
+        #include <raycast_splats>
+
+        void main() {
+          ivec2 uv = ivec2(vUv * vec2(renderSize));
+          uint splatId = uint(uv.x + uv.y * renderSize.x);
+
+          vec3 splatPos = texelFetch1D( bvh.position, splatId ).xyz;
+          vec3 lightDir = normalize(vec3(1,1,0));
+
+          splatPos = (vec4(splatPos, 1) * inverse(modelMatrix)).xyz; // ??
+          lightDir = (vec4(lightDir, 1) * inverse(cameraWorldMatrix)).xyz;
+
+          splatPos += lightDir/1e4;
+
+          vec4 color = vec4(0);
+          raycastSplats(splatPos, lightDir, color);
+          gl_FragColor.x = max(1.0 - color.a, 0.0);
+
+          //gl_FragColor.x = float(splatId) / float(splatsCount);
         }`
     });
 
@@ -241,7 +345,7 @@ async function init() {
   camera.updateProjectionMatrix();
 
   let orbit = new OrbitControls(camera, renderer.domElement);
-  orbit.addEventListener('change', resetRenderState);
+  orbit.addEventListener('change', () => resetRenderState());
 
   for (let i = 0; i < 2; i++)
     renderTargets[i] = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType });
@@ -252,6 +356,7 @@ async function init() {
   drawPixelsPass = new FullScreenQuad(new DrawPixelsMaterial());
   raytracingPass = new FullScreenQuad(new RaytracingMaterial());
   raytracingPass.material.updateDefines();
+  shadowsPass = new FullScreenQuad(new ComputeShadowsMaterial());
 
   initGeometry();
   rebuildGUI();
@@ -279,6 +384,9 @@ function resetRenderState() {
   }
 
   renderer.setRenderTarget(null);
+  
+  shadowsRT?.dispose();
+  shadowsRT = null;
 }
 
 async function loadGeometry() {
@@ -373,7 +481,7 @@ function rebuildGUI() {
     displayFolder.add(params, 'maxSplatsPerRay', 1, 64, 1).onChange(() => {
       raytracingPass.material.updateDefines();
     });
-    displayFolder.add(params, 'splatOpacity', -10, -1, 1);
+    displayFolder.add(params, 'splatOpacity', -12, 0, 0.5);
     displayFolder.add(params, 'splatSize', 0.001, 0.5, 0.001);
     displayFolder.add(params, 'showCost').onChange(() => {
       raytracingPass.material.updateDefines();
@@ -387,6 +495,34 @@ function updateBVH() {
   bvh = new MeshBVH(bvhMesh.geometry, getBVHOptions());
   if (!params.sparsity) console.timeEnd('MeshBVH');
   rebuildGUI();
+}
+
+function computeShadows() {
+  if (shadowsRT) return;
+
+  let n = pointCloud.geometry.attributes.position.count;
+  let exp2ceil = (m) => 2 ** Math.ceil(Math.log2(m));
+  let w = exp2ceil(Math.sqrt(n));
+  let h = exp2ceil(n / w);
+
+  shadowsRT = new THREE.WebGLRenderTarget(w, h, { format: THREE.RedFormat, type: THREE.FloatType });
+  
+  let dummyTex = new THREE.WebGLRenderTarget();
+
+  let uniforms = shadowsPass.material.uniforms;
+  uniforms.splatsCount.value = n;
+  uniforms.renderSize.value = [w, h];
+  uniforms.bvh.value.updateFrom(bvh);
+  uniforms.splatSize.value = params.splatSize;
+  uniforms.splatOpacity.value = 2 ** params.splatOpacity;
+  uniforms.cameraWorldMatrix.value.copy(camera.matrixWorld);
+  uniforms.projectionMatrix.value.copy(camera.projectionMatrix);
+  uniforms.modelMatrix.value.copy(pointCloud.matrixWorld);
+  uniforms.shadowsData.value = dummyTex;
+  renderer.setRenderTarget(shadowsRT);
+  shadowsPass.render(renderer);
+
+  dummyTex.dispose();
 }
 
 function render() {
@@ -406,14 +542,17 @@ function render() {
     camera.updateMatrixWorld();
     pointCloud.updateMatrixWorld();
 
+    computeShadows();
+
     let uniforms = raytracingPass.material.uniforms;
     uniforms.bvh.value.updateFrom(bvh);
     uniforms.splatSize.value = params.splatSize;
-    uniforms.splatOpacity.value = 2**params.splatOpacity;
+    uniforms.splatOpacity.value = 2 ** params.splatOpacity;
     uniforms.cameraWorldMatrix.value.copy(camera.matrixWorld);
     uniforms.projectionMatrix.value.copy(camera.projectionMatrix);
     uniforms.modelMatrix.value.copy(pointCloud.matrixWorld);
     uniforms.pixelData.value = renderTargets[0].texture;
+    uniforms.shadowsData.value = shadowsRT.texture;
     renderer.setRenderTarget(renderTargets[1]);
     raytracingPass.render(renderer);
 
