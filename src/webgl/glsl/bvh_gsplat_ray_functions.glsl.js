@@ -45,21 +45,25 @@ void intersectSplats(
     uint splatId = uTexelFetch1D( indexAttr, id + offset ).x;
 		vec3 pos = texelFetch1D( positionAttr, splatId ).xyz;
     vec2 tt = raySphere(rayOrigin - pos, rayDirection, splatSize);
-    float dist = (tt.x + tt.y)/2.; // one sample in the middle of the gaussian splat
+    
+    if (tt.x < tt.y) {
+      for (int s = 0; s < 1; s++) {
+        float dist = mix(tt.x, tt.y, (float(s) + 0.5)/1.0);
 
-		if (tt.x < tt.y && dist > 0. && dist < gSplatDists[MAX_SPLATS_PER_RAY-1]) {
-      
-      // insert the new sample point into the sorted list
-      res.numSplats = min(res.numSplats + 1, MAX_SPLATS_PER_RAY);
+        if (dist > 0. && dist < gSplatDists[MAX_SPLATS_PER_RAY-1]) {
+          // insert the new sample point into the sorted list
+          res.numSplats = min(res.numSplats + 1, MAX_SPLATS_PER_RAY);
 
-      for (int k = res.numSplats - 1; k >= 0 && dist < gSplatDists[k]; k--) {
-        if (k + 1 < MAX_SPLATS_PER_RAY) {
-          gSplatDists[k + 1] = gSplatDists[k];
-          gSplatIds[k + 1] = gSplatIds[k];
+          for (int k = res.numSplats - 1; k >= 0 && dist < gSplatDists[k]; k--) {
+            if (k + 1 < MAX_SPLATS_PER_RAY) {
+              gSplatDists[k + 1] = gSplatDists[k];
+              gSplatIds[k + 1] = gSplatIds[k];
+            }
+
+            gSplatDists[k] = dist;
+            gSplatIds[k] = splatId;
+          }
         }
-
-        gSplatDists[k] = dist;
-        gSplatIds[k] = splatId;
       }
     }
 	}
