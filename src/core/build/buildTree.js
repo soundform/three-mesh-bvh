@@ -42,8 +42,6 @@ export function buildTree( bvh, triangleBounds, offset, count, options ) {
 	const indexArray = geometry.index ? geometry.index.array : null;
 	const partionFunc = indirect ? partition_indirect : partition;
 
-  //debugger;
-
 	// generate intermediate variables
 	const totalTriangles = getTriCount( geometry );
 	const cacheCentroidBoundingData = new Float32Array( 6 );

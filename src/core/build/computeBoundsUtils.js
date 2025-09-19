@@ -76,6 +76,7 @@ export function getBounds( triangleBounds, offset, count, target, centroidTarget
 export function computeTriangleBounds( geo, target = null, offset = null, count = null ) {
 
 	const posAttr = geo.attributes.position;
+  const scaleAttr = geo.attributes.scale; // only for gsplats
 	const index = geo.index ? geo.index.array : null;
 	const triCount = getTriCount( geo );
 	const normalized = posAttr.normalized;
@@ -126,6 +127,16 @@ export function computeTriangleBounds( geo, target = null, offset = null, count 
 
 		}
 
+    // assuming that splats are spherical
+    let sa = 0, sb = 0, sc = 0;
+
+    if (scaleAttr) {
+      let m = scaleAttr.itemSize;
+      sa = scaleAttr.array[ai * m];
+      sb = scaleAttr.array[bi * m];
+      sc = scaleAttr.array[ci * m];
+    }
+
 		// we add the stride and offset here since we access the array directly
 		// below for the sake of performance
 		if ( ! normalized ) {
@@ -154,13 +165,8 @@ export function computeTriangleBounds( geo, target = null, offset = null, count 
 
 			}
 
-			let min = a;
-			if ( b < min ) min = b;
-			if ( c < min ) min = c;
-
-			let max = a;
-			if ( b > max ) max = b;
-			if ( c > max ) max = c;
+			let min = Math.min(a - sa, b - sb, c - sc);
+			let max = Math.max(a + sa, b + sb, c + sc);
 
 			// Increase the bounds size by float32 epsilon to avoid precision errors when
 			// converting to 32 bit float. Scale the epsilon by the size of the numbers being

@@ -4,6 +4,10 @@ export const bvh_gsplat_ray_functions = /* glsl */`
 #define MAX_SPLATS_PER_RAY 1
 #endif
 
+#ifndef MAX_SAMPLES_PER_SPLAT
+#define MAX_SAMPLES_PER_SPLAT 1
+#endif
+
 float[MAX_SPLATS_PER_RAY] gSplatDists;
 uint[MAX_SPLATS_PER_RAY] gSplatIds;
 
@@ -34,7 +38,7 @@ vec2 raySphere(vec3 ro, vec3 rd, float r) {
 }
 
 void intersectSplats(
-	sampler2D positionAttr, float splatSize, usampler2D indexAttr, uint offset, uint count,
+	sampler2D positionAttr, sampler2D splatSizes, usampler2D indexAttr, uint offset, uint count,
 	vec3 rayOrigin, vec3 rayDirection,
 	inout BVHIntersectResult res
 ) {
@@ -44,11 +48,12 @@ void intersectSplats(
 		
     uint splatId = uTexelFetch1D( indexAttr, id + offset ).x;
 		vec3 pos = texelFetch1D( positionAttr, splatId ).xyz;
-    vec2 tt = raySphere(rayOrigin - pos, rayDirection, splatSize);
+    float radius = texelFetch1D( splatSizes, splatId ).x;
+    vec2 tt = raySphere(rayOrigin - pos, rayDirection, radius);
     
     if (tt.x < tt.y) {
-      for (int s = 0; s < 1; s++) {
-        float dist = mix(tt.x, tt.y, (float(s) + 0.5)/1.0);
+      for (int s = 0; s < MAX_SAMPLES_PER_SPLAT; s++) {
+        float dist = mix(tt.x, tt.y, (float(s) + 0.5)/float(MAX_SAMPLES_PER_SPLAT));
 
         if (dist > 0. && dist < gSplatDists[MAX_SPLATS_PER_RAY-1]) {
           // insert the new sample point into the sorted list
@@ -69,10 +74,10 @@ void intersectSplats(
 	}
 }
 
-vec2 rayBVH( vec3 rayOrigin, vec3 rayDirection, float splatSize, sampler2D bvhBounds, uint nodeId ) {
+vec2 rayBVH( vec3 rayOrigin, vec3 rayDirection, sampler2D bvhBounds, uint nodeId ) {
 	uint cni2 = nodeId * 2u;
-	vec3 boundsMin = texelFetch1D( bvhBounds, cni2 + 0u ).xyz - splatSize;
-	vec3 boundsMax = texelFetch1D( bvhBounds, cni2 + 1u ).xyz + splatSize;
+	vec3 boundsMin = texelFetch1D( bvhBounds, cni2 + 0u ).xyz;
+	vec3 boundsMax = texelFetch1D( bvhBounds, cni2 + 1u ).xyz;
   return rayBox( rayOrigin, rayDirection, boundsMin, boundsMax );
 }
 
@@ -93,7 +98,7 @@ bool _bvhIntersectSplats(
 
 	// ray
 	vec3 rayOrigin, vec3 rayDirection,
-  float splatSize,
+  sampler2D splatSizes,
 	inout BVHIntersectResult res
 ) {
 
@@ -109,7 +114,7 @@ bool _bvhIntersectSplats(
 
 		uint nodeId = stack[ ptr-- ];
     res.numLookupsBVH++;
-    vec2 tt = rayBVH( rayOrigin, rayDirection, splatSize, bvh_bvhBounds, nodeId );
+    vec2 tt = rayBVH( rayOrigin, rayDirection, bvh_bvhBounds, nodeId );
 		if (tt.x >= tt.y || tt.x >= gSplatDists[MAX_SPLATS_PER_RAY-1])
 			continue;
 
@@ -123,7 +128,7 @@ bool _bvhIntersectSplats(
 			uint offset = boundsInfo.y;
 
 			intersectSplats(
-				bvh_position, splatSize, bvh_index, offset, count,
+				bvh_position, splatSizes, bvh_index, offset, count,
 				rayOrigin, rayDirection, res);
 
 		} else {
