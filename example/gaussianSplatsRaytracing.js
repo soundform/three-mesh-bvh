@@ -26,9 +26,9 @@ const params = {
   splatScale: 1.5, // exp2, same as maxStdDev in https://sparkjs.dev
   splatOpacity: 0, // exp2, density that absorbs light 
   splatBrightness: 0, // exp2, luminance that emits light
-  maxRaycasts: 1,
+  maxSamplesPerSplat: 1,
   maxSplatsPerRay: 8,
-  showShadows: true,
+  shadows: true,
   showCost: false,
 };
 
@@ -37,10 +37,12 @@ const getBVHOptions = () => ({ strategy: params.strategy, maxLeafTris: params.ma
 let renderer, camera, scene, gui, stats, outputContainer;
 let bvh, bvhMesh, bvhHelper, pointCloud;
 let raytracingPass, drawPixelsPass, shadowsPass;
-let renderTargets = [], shadowsDataRT, splatColorsRT, splatSizesRT;
+let renderTargets = [];
+let shadowsDataRT, splatColorsRT, splatSizesRT;
 let dummyRT = new THREE.WebGLRenderTarget();
 let lightDir = new THREE.Vector3(-1, 1, 1).normalize();
 let frameId = 0;
+
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
 //const sceneFile = 'models/bunny.glb';
@@ -92,18 +94,17 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
   #define USE_SHADOWS 0
   #endif
   
-  // 2/sqrt(PI)*integrate(exp(-x*x))
+  // integrate(exp(-x*x))*2/sqrt(PI) = -1..1
   float erfc(float x) {
       return sign(x)*sqrt(1. - exp2(-1.787776*x*x));
   }
 
-  float integrateGaussian(vec3 ro, vec3 rd, float SR) {
-    float b = dot(ro, rd);
-    float h = dot(ro, ro) - b*b;
-    float s = (1. + erfc(b*SR))/SR;
-    s *= sqrt(PI)/2.;
-    s *= exp(-SR*SR*h);
-    return s;
+  // integrate(exp(-sqr(pos + dir*t)), t=0..INF) = 0..sqrt(PI)
+  float erfc_3d(vec3 pos, vec3 dir) {
+    float b = dot(pos, -dir);
+    float h = dot(pos, pos) - b*b;
+    float s = 1. + erfc(b); // 0..2
+    return s*exp(-h)*sqrt(PI)/2.;
   }
 
   float raycastSplats(vec3 ro, vec3 rd, inout vec4 rgba) {
@@ -124,37 +125,34 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
       // blend all splats along the ray
       for (int i = 0; i < res.numSplats; i++) {
         uint splatId = gSplatIds[i];
-        vec3 splatPos = texelFetch1D( bvh.position, splatId ).xyz;
-        float radius = texelFetch1D( splatsData.splatSizes, splatId ).x;
+        vec4 color = texelFetch1D(splatsData.splatColors, splatId);
+        vec4 splatPos = texelFetch1D( bvh.position, splatId );
+        float radius = splatPos.w; // texelFetch1D( splatsData.splatSizes, splatId ).x;
         float scale = radius/splatsData.splatScale*sqrt(2.0);
         float dist = gSplatDists[i];
-        vec3 pos = ro + rd*dist - splatPos;
-        float density = exp(-dot(pos/scale, pos/scale));
-        //density /= float(MAX_SAMPLES_PER_SPLAT);
-        //if (length(pos) > radius) continue;
+        vec3 pos = ro + rd*dist - splatPos.xyz;
 
         // beware of float32 accuracy
-        eps = max(dist/1e6, radius/1e4);
+        eps = max(dist/1e6, radius/1e6);
 
-        vec4 splatColor = texelFetch1D(splatsData.splatColors, splatId);
-        float opacity = splatColor.a * splatsData.splatOpacity;
-
-        // color.a = the amount of particles along the ray
-        vec4 color = vec4(splatColor.rgb, density * opacity);
+        // .w = the amount of particles along the ray
+        color.w *= splatsData.splatOpacity;
 
         #if USE_SHADOWS
           
-          color.rgb *= texelFetch1D(splatsData.shadowsData, splatId).x;
-          float sum = integrateGaussian(pos, lightDir, 1./scale);
-          color.rgb *= exp(-sum * opacity * 1e0);
+          float luminance = texelFetch1D(splatsData.shadowsData, splatId).x;
+          float fog = erfc_3d(pos/scale, lightDir)/sqrt(PI);
+          color.rgb *= luminance * exp(-fog * color.w);
         
         #endif
 
-        // normal blending
-        color.rgb *= color.a;
-        rgba += color * (1.0 - rgba.a);
-        rgba.a = clamp(rgba.a, 0.0, 1.0);
-        if (rgba.a > 0.995)
+        // density, same as integrating the gaussian along the ray
+        color.w *= exp(-dot(pos/scale, pos/scale));
+        //color.w *= erfc_3d((pos - rd*radius*9.5)/scale, rd)/sqrt(PI);
+
+        color.rgb *= color.w;
+        rgba += color * (1.0 - rgba.w);
+        if (rgba.w > 0.995)
           return INFINITY;
       }
 
@@ -171,8 +169,8 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
   updateDefines() {
     this.defines.MAX_SPLATS_PER_RAY = params.maxSplatsPerRay;
     this.defines.SHOW_COST = +params.showCost;
-    this.defines.USE_SHADOWS = +params.showShadows;
-    this.defines.MAX_RAYCASTS = params.maxRaycasts;
+    this.defines.USE_SHADOWS = +params.shadows;
+    this.defines.MAX_SAMPLES_PER_SPLAT = params.maxSamplesPerSplat;
     this.needsUpdate = true;
   }
 
@@ -248,8 +246,8 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
           vec2 size = vec2(textureSize(pixelData, 0));
 
           // .x = Y' of the Y'UV color
-          // .y = UV of the Y'UV color, packed as float16
-          // .z = Z depth for raycasting
+          // .y = UV of the Y'UV color, packed as 2 x float16
+          // .z = current Z depth for raycasting
           // .a = opacity of the accumulated color in the 0..1 range
           vec4 rayData = texelFetch(pixelData, ivec2(vUv*size), 0);
 
@@ -352,16 +350,17 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
           ivec2 size = textureSize(bvh.position, 0);
           ivec2 uv = ivec2(vUv * vec2(size));
           uint splatId = uint(uv.x + uv.y * size.x);
-          vec3 splatPos = texelFetch1D( bvh.position, splatId ).xyz;
-          float radius = texelFetch1D( splatsData.splatSizes, splatId ).x;
+          vec4 pos = texelFetch1D( bvh.position, splatId );
+          float radius = pos.w; // texelFetch1D( splatsData.splatSizes, splatId ).x;
 
-          //splatPos = (vec4(splatPos, 1) * modelMatrix).xyz; // ??
-          vec3 lightDirCam = lightDir; // (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
-          splatPos += lightDirCam * radius;
+          //pos = (vec4(pos, 1) * modelMatrix).xyz; // ??
+          vec3 dir = lightDir; // (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
+          pos.xyz += dir * radius;
 
           gl_FragColor = vec4(0);
-          raycastSplats(splatPos, lightDirCam, gl_FragColor);
+          raycastSplats(pos.xyz, dir, gl_FragColor);
           gl_FragColor.x = max(1.0 - gl_FragColor.w, 0.0);
+          gl_FragColor.x += 0.2; // this should be ambient occlusion (AO) or global illumination (GI)
         }`
     });
 
@@ -406,8 +405,7 @@ class DrawPixelsMaterial extends THREE.ShaderMaterial {
             o.w = 1.0;
           } else {
             vec3 yuv = vec3(o.x, UNPACK_2x16(o.y)); // Y'UV
-            o.rgb = YUV_RGB*yuv;
-            o.rgb *= splatBrightness;
+            o.rgb = splatBrightness*YUV_RGB*yuv;
             o.w = 1.0;
           }
 
@@ -440,8 +438,8 @@ class SplatColorsMaterial extends THREE.ShaderMaterial {
 
       fragmentShader: /* glsl */`
         in vec2 vUv;
-        struct PLY { sampler2D f_dc, rgb, opacity; };
-        uniform PLY ply;
+
+        uniform struct { sampler2D f_dc, rgb, opacity; } ply;
 
         #include <common>
 
@@ -452,7 +450,7 @@ class SplatColorsMaterial extends THREE.ShaderMaterial {
           vec3 f_dc = texelFetch(ply.f_dc, ivec2(vUv*size), 0).rgb;
           float opacity = texelFetch(ply.opacity, ivec2(vUv*size), 0).x;
 
-          gl_FragColor = vec4(1.0, 0.3, 0.1, 1.0);
+          gl_FragColor = vec4(1);
 
           if (!isnan(rgb.x)) gl_FragColor.rgb = rgb/255.;
           if (!isnan(f_dc.x)) gl_FragColor.rgb = f_dc/sqrt(PI)*0.5 + 0.5;
@@ -563,7 +561,7 @@ async function loadGeometry() {
 async function loadPLY() {
   let ply = new PLYLoader();
 
-  // geometry.attributes
+  // these will go to geometry.attributes
   ply.setCustomPropertyNameMapping({
     scale: ['scale_0', 'scale_1', 'scale_2'], // scale = log(S)
     f_dc: ['f_dc_0', 'f_dc_1', 'f_dc_2'], // f_dc = (RGB - 0.5)*sqrt(PI)*2.0
@@ -588,7 +586,6 @@ async function initGeometry() {
   const geometry = await loadGeometry();
   const material = new THREE.PointsMaterial({ color: 0xFFFFFF });
   pointCloud = new THREE.Points(geometry, material);
-  pointCloud.name = 'Point Cloud';
   pointCloud.matrixAutoUpdate = false;
   scene.add(pointCloud);
 
@@ -610,21 +607,20 @@ function updateBVHMesh() {
 
   outputContainer.textContent = (index.length / 3) + ' splats';
 
-  const scaleAttr = attributes.scale ? attributes.scale.clone() :
-    new THREE.BufferAttribute(new Float32Array(count * 3), 3);
   const baseScale = 2 ** params.splatScale;
+  const scaleAttr = attributes.scale ? attributes.scale.clone() :
+    new THREE.BufferAttribute(new Float32Array(count), 1);
 
   if (attributes.scale && Number.isFinite(scaleAttr.array[0])) {
     for (let i = 0; i < scaleAttr.array.length; i++)
       scaleAttr.array[i] = baseScale * Math.exp(scaleAttr.array[i]);
   } else {
-    // Some PLY files don't have scale_0/1/2 attributes.
-    scaleAttr.array.fill(baseScale * 0.003);
+    scaleAttr.array.fill(baseScale * 0.0025);
   }
 
   bvhGeometry.setIndex(index);
-  bvhGeometry.setAttribute('position', attributes.position);
-  bvhGeometry.setAttribute('scale', scaleAttr);
+  bvhGeometry.setAttribute('position', attributes.position.clone());
+  bvhGeometry.setAttribute('scale', scaleAttr); // this is for computeTriangleBounds
   bvhGeometry.computeBoundsTree(getBVHOptions());
 
   scene.remove(bvhHelper);
@@ -635,7 +631,6 @@ function updateBVHMesh() {
   bvhHelper = new MeshBVHHelper(bvhMesh, params.depth);
   bvhHelper.displayParents = true;
   bvhHelper.opacity = 0.1;
-  bvhHelper.name = 'BVH Helper';
   bvhHelper.update();
   scene.add(bvhHelper);
 
@@ -675,32 +670,48 @@ function rebuildGUI() {
   });
 
   if (params.mode === 'gaussians') {
-    //displayFolder.add(params, 'maxRaycasts', 1, 16, 1).onChange(() => {
-    //  raytracingPass.material.updateDefines();
-    //});
+    displayFolder.add(params, 'maxSamplesPerSplat', 1, 4, 1).onChange(() => {
+      raytracingPass.material.updateDefines();
+    });
     displayFolder.add(params, 'maxSplatsPerRay', 1, 64, 1).onChange(() => {
       raytracingPass.material.updateDefines();
     });
     displayFolder.add(params, 'splatOpacity', -3.5, 3.5, 0.5);
     displayFolder.add(params, 'splatBrightness', -3, 10, 0.5);
-    displayFolder.add(params, 'splatScale', 0, 2.5, 0.25).onChange(() => {
+    displayFolder.add(params, 'splatScale', 0, 3, 0.25).onChange(() => {
       updateBVHMesh();
       updateSplatSizes();
     });
     displayFolder.add(params, 'showCost').onChange(() => {
       raytracingPass.material.updateDefines();
     });
-    displayFolder.add(params, 'showShadows').onChange(() => {
+    displayFolder.add(params, 'shadows').onChange(() => {
       raytracingPass.material.updateDefines();
     });
   }
 }
 
 function updateBVH() {
-  if (!params.sparsity) console.time('MeshBVH');
-  bvh = new MeshBVH(bvhMesh.geometry, getBVHOptions());
-  if (!params.sparsity) console.timeEnd('MeshBVH');
-  rebuildGUI();
+  //console.time('MeshBVH');
+
+  let geometry = bvhMesh.geometry;
+  bvh = new MeshBVH(geometry, getBVHOptions());
+
+  // (position.xyz, scale.x) -> position.xyzw
+  let { position, scale } = geometry.attributes;
+
+  let count = position.count;
+  let position4 = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
+
+  for (let i = 0; i < count; i++) {
+    position4.array[i * 4 + 3] = scale.array[i * scale.itemSize];
+    for (let j = 0; j < 3; j++)
+      position4.array[i * 4 + j] = position.array[i * position.itemSize + j];
+  }
+
+  position.copy(position4);
+
+  //console.timeEnd('MeshBVH');
 }
 
 function updateSplatColors(geometry) {
@@ -733,6 +744,9 @@ function updateSplatColors(geometry) {
 }
 
 function updateSplatSizes(geometry = bvhMesh.geometry) {
+  splatSizesRT = dummyRT;
+  return;
+
   let attributes = geometry.attributes;
   let scale = new FloatVertexAttributeTexture();
   scale.updateFrom(attributes.scale);
@@ -786,7 +800,7 @@ function render() {
     camera.updateMatrixWorld();
     pointCloud.updateMatrixWorld();
 
-    if (frameId == 0 && params.showShadows && !shadowsDataRT)
+    if (frameId == 0 && params.shadows && !shadowsDataRT)
       updateShadowsData();
 
     let uniforms = raytracingPass.material.uniforms;

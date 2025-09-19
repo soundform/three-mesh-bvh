@@ -47,9 +47,9 @@ void intersectSplats(
   for (uint id = 0u; id < count; id++) {
 		
     uint splatId = uTexelFetch1D( indexAttr, id + offset ).x;
-		vec3 pos = texelFetch1D( positionAttr, splatId ).xyz;
-    float radius = texelFetch1D( splatSizes, splatId ).x;
-    vec2 tt = raySphere(rayOrigin - pos, rayDirection, radius);
+		vec4 pos = texelFetch1D( positionAttr, splatId );
+    float radius = pos.w; // texelFetch1D( splatSizes, splatId ).x;
+    vec2 tt = raySphere(rayOrigin - pos.xyz, rayDirection, radius);
     
     if (tt.x < tt.y) {
       for (int s = 0; s < MAX_SAMPLES_PER_SPLAT; s++) {
