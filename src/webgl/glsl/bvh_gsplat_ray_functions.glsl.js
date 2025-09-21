@@ -38,7 +38,7 @@ vec2 raySphere(vec3 ro, vec3 rd, float r) {
 }
 
 void intersectSplats(
-	sampler2D positionAttr, sampler2D splatSizes, usampler2D indexAttr, uint offset, uint count,
+	sampler2D positionAttr, usampler2D indexAttr, uint offset, uint count,
 	vec3 rayOrigin, vec3 rayDirection,
 	inout BVHIntersectResult res
 ) {
@@ -47,9 +47,8 @@ void intersectSplats(
   for (uint id = 0u; id < count; id++) {
 		
     uint splatId = uTexelFetch1D( indexAttr, id + offset ).x;
-		vec4 pos = texelFetch1D( positionAttr, splatId );
-    float radius = pos.w; // texelFetch1D( splatSizes, splatId ).x;
-    vec2 tt = raySphere(rayOrigin - pos.xyz, rayDirection, radius);
+		vec4 splat = texelFetch1D( positionAttr, splatId );
+    vec2 tt = raySphere(rayOrigin - splat.xyz, rayDirection, splat.w);
     
     if (tt.x < tt.y) {
       for (int s = 0; s < MAX_SAMPLES_PER_SPLAT; s++) {
@@ -85,11 +84,11 @@ vec2 rayBVH( vec3 rayOrigin, vec3 rayDirection, sampler2D bvhBounds, uint nodeId
 #define\
 	bvhIntersectSplats(\
 		bvh,\
-		rayOrigin, rayDirection, splatSize, res\
+		rayOrigin, rayDirection, res\
 	)\
 	_bvhIntersectSplats(\
 		bvh.position, bvh.index, bvh.bvhBounds, bvh.bvhContents,\
-		rayOrigin, rayDirection, splatSize, res\
+		rayOrigin, rayDirection, res\
 	)
 
 bool _bvhIntersectSplats(
@@ -98,7 +97,6 @@ bool _bvhIntersectSplats(
 
 	// ray
 	vec3 rayOrigin, vec3 rayDirection,
-  sampler2D splatSizes,
 	inout BVHIntersectResult res
 ) {
 
@@ -128,7 +126,7 @@ bool _bvhIntersectSplats(
 			uint offset = boundsInfo.y;
 
 			intersectSplats(
-				bvh_position, splatSizes, bvh_index, offset, count,
+				bvh_position, bvh_index, offset, count,
 				rayOrigin, rayDirection, res);
 
 		} else {
