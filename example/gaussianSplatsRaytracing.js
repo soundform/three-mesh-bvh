@@ -19,8 +19,11 @@ THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 
 const params = {
+  open: () => selectScene(),
+
   mode: 'points',
   strategy: SAH,
+  maxDepth: 32,
   maxLeafTris: 8,
   sparsity: 0,
   splatScale: 1.5, // exp2, same as maxStdDev in https://sparkjs.dev
@@ -28,17 +31,21 @@ const params = {
   splatBrightness: 0, // exp2, luminance that emits light
   maxSamplesPerSplat: 1,
   maxSplatsPerRay: 8,
-  shadows: true,
+  flipY: false,
+  shadows: false,
   showCost: false,
 };
 
-const getBVHOptions = () => ({ strategy: params.strategy, maxLeafTris: params.maxLeafTris });
+const getBVHOptions = () => ({
+  strategy: params.strategy,
+  maxDepth: params.maxDepth,
+  maxLeafTris: params.maxLeafTris,
+});
 
 let renderer, camera, scene, gui, stats, outputContainer;
 let bvh, bvhMesh, bvhHelper, pointCloud;
 let raytracingPass, drawPixelsPass, shadowsPass;
-let renderTargets = [];
-let shadowsDataRT, splatColorsRT;
+let pixelsRT1, pixelsRT2, shadowsDataRT, splatColorsRT;
 let dummyRT = new THREE.WebGLRenderTarget();
 let lightDir = new THREE.Vector3(-1, 1, 1).normalize();
 let frameId = 0;
@@ -55,7 +62,7 @@ class GSplatsDataUniformStruct {
   splatOpacity = 2 ** params.splatOpacity;
   splatBrightness = 2 ** params.splatBrightness;
   splatColors = splatColorsRT.texture;
-  shadowsData = shadowsDataRT.texture;
+  shadowsData = shadowsDataRT?.texture || dummyRT.texture;
 }
 
 THREE.ShaderChunk['yuv_rgb'] = /* glsl */`
@@ -97,74 +104,123 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
       return sign(x)*sqrt(1. - exp2(-1.787776*x*x));
   }
 
-  // integrate(exp(-sqr(pos + dir*t)), t=0..INF) = 0..sqrt(PI)
+  // integrate(exp(-sqr(pos + dir*t)), t=0..INF)*2/sqrt(PI) = 0..2
   float erfc_3d(vec3 pos, vec3 dir) {
-    float b = dot(pos, -dir);
-    float h = dot(pos, pos) - b*b;
-    float s = 1. + erfc(b); // 0..2
-    return s*exp(-h)*sqrt(PI)/2.;
+    float b = dot(pos, -dir);       // -INF..INF
+    float h = dot(pos, pos) - b*b;  // 0..INF
+    float s = 1. + erfc(b);         // 0..2
+    return s*exp(-h);
   }
 
-  float raycastSplats(vec3 ro, vec3 rd, inout vec4 rgba) {
+  float raycastSplats(vec3 rayOrigin, vec3 rayDir, inout vec4 rgba) {
     BVHIntersectResult res;
-    bvhIntersectSplats( bvh, ro, rd, res );
+    bvhIntersectSplats( bvh, rayOrigin, rayDir, res );
 
     float eps = 0.;
 
     #if SHOW_COST
       
-      vec4 cost = vec4(res.numLookupsBVH, res.numLookupsSplats, res.numSplats, 0)/1e3;
+      vec4 cost = vec4(res.numLookupsBVH, res.numLookupsSplats, res.numSplats, 0);
+      cost /= float(gsd.splatsCount)/1e2;
       // rgba.zw are reserved for raytracing metadata
       cost += UNPACK_4x16(rgba.xy);
       rgba.xy = PACK_4x16(cost);
 
     #else
+      
+      if (res.numSplats == 0)
+        return INFINITY;
 
-      // blend all splats along the ray
-      for (int i = 0; i < res.numSplats; i++) {
-        uint splatId = gSplatIds[i];
-        vec4 color = texelFetch1D(splatsData.splatColors, splatId);
-        vec4 splat = texelFetch1D( bvh.position, splatId );
-        float radius = splat.w;
-        float scale = splat.w/splatsData.splatScale*sqrt(2.0);
-        float dist = gSplatDists[i];
-        vec3 pos = ro + rd*dist - splat.xyz;
+      vec2[MAX_SPLATS_PER_RAY*2] pts; // sorted by .x
 
-        // beware of float32 accuracy
-        eps = max(dist/1e6, radius/1e6);
+      for (int k = 0; k < res.numSplats; k++) {
+        vec2 tt = gSplatDists[k];
 
-        // .w = the amount of particles along the ray
-        color.w *= splatsData.splatOpacity;
+        for (int i = 0; i < 2; i++) {
+          vec2 pt = vec2(tt[i], k+1);
+          pt.y *= i == 0 ? +1. : -1.;
+          pts[k*2+i] = pt;
 
-        #if USE_SHADOWS
-          
-          float luminance = texelFetch1D(splatsData.shadowsData, splatId).x;
-          float fog = erfc_3d(pos/scale, lightDir)/sqrt(PI);
-          color.rgb *= luminance * exp(-fog * color.w);
-        
-        #endif
+          for (int j = k*2+i; j > 0; j--) {
+            if (pts[j].x >= pts[j-1].x)
+              break;
+            pts[j] = pts[j-1];
+            pts[j-1] = pt;
+          }
+        }
+      }
 
-        // density, same as integrating the gaussian along the ray
-        color.w *= exp(-dot(pos/scale, pos/scale));
-        //color.w *= erfc_3d((pos - rd*radius*9.5)/scale, rd)/sqrt(PI);
+      int bitmask = 0;
 
-        color.rgb *= color.w;
-        rgba += color * (1.0 - rgba.w);
-        if (rgba.w > 0.995)
-          return INFINITY;
+      for (int k = 0; k < res.numSplats*2 - 1; k++) {
+        int b = int(pts[k].y);
+        if (b > 0) bitmask |=  (1 << (+b - 1));
+        if (b < 0) bitmask &= ~(1 << (-b - 1));
+        if (bitmask == 0) continue;
+
+        vec2 segment = vec2(pts[k].x, pts[k+1].x);
+
+        for (int i = 0; i < res.numSplats; i++) {
+          if ((bitmask & (1 << i)) == 0)
+            continue;
+
+          uint splatId = gSplatIds[i];
+          vec4 color = texelFetch1D(gsd.splatColors, splatId);
+          vec4 splat = texelFetch1D(bvh.position, splatId);
+          float radius = splat.w;
+
+          vec2 seg = raySphere(rayOrigin - splat.xyz, rayDir, radius);
+          seg.x = max(seg.x, segment.x);
+          seg.y = min(seg.y, segment.y);
+          if (seg.x >= seg.y) continue;
+
+          float scale = radius/gsd.splatScale*sqrt(2.0);
+          float dist = dot(vec2(0.5), segment); // gSplatDists[i];
+          vec3 midpoint = rayOrigin - splat.xyz + rayDir*dist;
+
+          // beware of float32 accuracy
+          eps = max(dist, radius)/1e6;
+
+          // .rgb = emission
+          // .a = absorption
+          color.rgb *= color.rgb; // blend RGB^2, then output sqrt(RGB)
+          color.w *= gsd.splatOpacity;
+
+          #if USE_SHADOWS
+
+            float luminance = texelFetch1D(gsd.shadowsData, splatId).x;
+            float fog = erfc_3d(midpoint/scale, lightDir)*0.5; // 0..1
+            color.rgb *= luminance * exp(-fog * color.w);
+
+          #endif
+
+          // total gaussian density within the segment of the ray
+          //color.w *= exp(-dot(midpoint/scale, midpoint/scale));
+          float fx = erfc_3d((rayOrigin - splat.xyz + rayDir*seg.x)/scale, rayDir);
+          float fy = erfc_3d((rayOrigin - splat.xyz + rayDir*seg.y)/scale, rayDir);
+          color.w *= max(fx - fy, 0.)*0.5; // 0..1
+
+          color.rgb *= color.w;
+          rgba.rgb += color.rgb * exp(-rgba.w);
+          rgba.w += color.w;
+
+          if (rgba.w > 4.0)
+            return INFINITY;
+        }
       }
 
     #endif
     
     if (res.numSplats < MAX_SPLATS_PER_RAY)
       return INFINITY;
-    return eps + gSplatDists[res.numSplats - 1];
+    return eps + dot(vec2(0.5), gSplatDists[res.numSplats - 1]);
   }
 `;
 
 class RaytracingMaterial extends THREE.ShaderMaterial {
 
   updateDefines() {
+    this.defines.BVH_STACK_DEPTH = params.maxDepth;
     this.defines.MAX_SPLATS_PER_RAY = params.maxSplatsPerRay;
     this.defines.SHOW_COST = +params.showCost;
     this.defines.USE_SHADOWS = +params.shadows;
@@ -188,7 +244,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
       uniforms: {
 
         bvh: { value: new MeshBVHUniformStruct() },
-        splatsData: { value: null },
+        gsd: { value: null },
         pixelData: { value: null },
 
         cameraWorldMatrix: { value: new THREE.Matrix4() },
@@ -218,7 +274,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
         #include <gsplats_data>
 
         uniform BVH bvh;
-        uniform GSplatsData splatsData;
+        uniform GSplatsData gsd;
         uniform sampler2D pixelData;
 
         uniform mat4 cameraWorldMatrix;
@@ -290,21 +346,22 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
 
 class ComputeShadowsMaterial extends THREE.ShaderMaterial {
 
-  constructor(params) {
+  constructor() {
 
     super({
 
       defines: {
 
         USE_SHADOWS: 0,
-        MAX_SPLATS_PER_RAY: 32,
+        BVH_STACK_DEPTH: params.maxDepth,
+        MAX_SPLATS_PER_RAY: 16,
 
       },
 
       uniforms: {
 
         bvh: { value: new MeshBVHUniformStruct() },
-        splatsData: { value: null },
+        gsd: { value: null },
 
         cameraWorldMatrix: { value: new THREE.Matrix4() },
         projectionMatrix: { value: new THREE.Matrix4() },
@@ -332,7 +389,7 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
         #include <gsplats_data>
 
         uniform BVH bvh;
-        uniform GSplatsData splatsData;
+        uniform GSplatsData gsd;
 
         uniform mat4 cameraWorldMatrix;
         uniform mat4 projectionMatrix;
@@ -354,12 +411,10 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
 
           gl_FragColor = vec4(0);
           raycastSplats(splat.xyz + dir*splat.w, dir, gl_FragColor);
-          gl_FragColor.x = max(1.0 - gl_FragColor.w, 0.0);
+          gl_FragColor.x = max(exp(-gl_FragColor.w), 0.0);
           gl_FragColor.x += 0.2; // this should be ambient occlusion (AO) or global illumination (GI)
         }`
     });
-
-    this.setValues(params);
   }
 }
 
@@ -401,6 +456,8 @@ class DrawPixelsMaterial extends THREE.ShaderMaterial {
           } else {
             vec3 yuv = vec3(o.x, UNPACK_2x16(o.y)); // Y'UV
             o.rgb = splatBrightness*YUV_RGB*yuv;
+            o.rgb = sqrt(o.rgb); // gamma correction
+            o.rgb *= 1.0 - exp(-o.w);
             o.w = 1.0;
           }
 
@@ -455,36 +512,11 @@ class SplatColorsMaterial extends THREE.ShaderMaterial {
   }
 }
 
-class CopyShaderMaterial extends THREE.ShaderMaterial {
-  constructor() {
-    super({
-      uniforms: {
-        sourceTex: { value: null },
-      },
-
-      vertexShader: /* glsl */`
-        out vec2 vUv;
-        void main() {
-          vUv = uv;
-          gl_Position = vec4( position, 1.0 );
-        }
-      `,
-
-      fragmentShader: /* glsl */`
-        in vec2 vUv;
-        uniform sampler2D sourceTex;
-        void main() {
-          gl_FragColor = texture(sourceTex, vUv);
-        }`
-    });
-  }
-}
-
 async function init() {
   outputContainer = document.getElementById('output');
 
   // renderer setup
-  renderer = new THREE.WebGLRenderer({ antialias: false });
+  renderer = new THREE.WebGLRenderer({ preserveDrawingBuffer: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setClearColor(0, 0);
@@ -496,16 +528,16 @@ async function init() {
   light.position.set(lightDir);
   scene.add(light);
 
-  camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.001, 50);
+  camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.001, 50);
   camera.position.set(1, 1, 2);
   camera.far = 100;
   camera.updateProjectionMatrix();
 
   let orbit = new OrbitControls(camera, renderer.domElement);
-  orbit.addEventListener('change', () => resetRenderState());
+  orbit.addEventListener('change', () => clearRenderTargets());
 
-  for (let i = 0; i < 2; i++)
-    renderTargets[i] = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType });
+  pixelsRT1 = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType });
+  pixelsRT2 = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType });
 
   stats = new Stats();
   document.body.appendChild(stats.dom);
@@ -517,9 +549,15 @@ async function init() {
 
   initGeometry();
   rebuildGUI();
-  updateRenderSize();
 
-  window.addEventListener('resize', updateRenderSize, false);
+  updateRenderSize();
+  window.addEventListener('resize',
+    () => updateRenderSize(), false);
+
+  document.addEventListener('keypress', (e) => {
+    if (e.code == 'Space')
+      orbit.enabled = !orbit.enabled;
+  });
 }
 
 function updateRenderSize() {
@@ -528,32 +566,56 @@ function updateRenderSize() {
   camera.updateProjectionMatrix();
 
   renderer.setSize(w, h);
-  resetRenderState();
+  clearRenderTargets();
 }
 
-function resetRenderState() {
+function clearRenderTargets() {
   let w = window.innerWidth, h = window.innerHeight;
-
-  renderTargets[0].setSize(w, h);
-  renderTargets[1].setSize(w, h);
-
+  pixelsRT1.setSize(w, h);
+  pixelsRT2.setSize(w, h);
   frameId = 0;
 }
 
-async function loadGeometry() {
-  console.time('loadGeometry');
-  console.log('Loading scene:', sceneFile);
+async function selectScene() {
+  let input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '*.ply';
+  input.multiple = false;
+  input.click();
+  let blob = await new Promise(resolve =>
+    input.onchange = () => resolve(input.files[0]));
+  if (!blob) return;
 
-  let geometry = sceneFile.endsWith('.ply') ?
-    await loadPLY() :
-    await loadGLTF();
+  shadowsDataRT?.dispose();
+  shadowsDataRT = null;
+  splatColorsRT?.dispose();
+  splatColorsRT = null;
+  frameId = -1;
+
+  console.log('Opening file:', (blob.size / 1e6).toFixed(1), 'MB', blob.name);
+  let url = URL.createObjectURL(blob);
+  await initGeometry(url, blob.name);
+  URL.revokeObjectURL(url);
+
+  frameId = 0;
+  clearRenderTargets();
+  render();
+}
+
+async function loadGeometry(url, filename = url) {
+  console.time('loadGeometry');
+  console.log('Loading scene:', filename);
+
+  let geometry = filename.endsWith('.ply') ?
+    await loadPLY(url) :
+    await loadGLTF(url);
 
   geometry.center();
   console.timeEnd('loadGeometry');
   return geometry;
 }
 
-async function loadPLY() {
+async function loadPLY(url) {
   let ply = new PLYLoader();
 
   // these will go to geometry.attributes
@@ -565,21 +627,22 @@ async function loadPLY() {
     // rot: ['rot_0', 'rot_1', 'rot_2', 'rot_3'], // quaternion rotation
   });
 
-  return await ply.loadAsync(sceneFile);
+  return await ply.loadAsync(url);
 }
 
-async function loadGLTF() {
+async function loadGLTF(url) {
   let gltf = await new GLTFLoader()
     .setMeshoptDecoder(MeshoptDecoder)
-    .loadAsync(sceneFile);
+    .loadAsync(url);
   gltf.scene.updateMatrixWorld(true);
   let gltfMesh = gltf.scene.children[0];
   return gltfMesh.geometry;
 }
 
-async function initGeometry() {
-  const geometry = await loadGeometry();
+async function initGeometry(url = sceneFile, filename) {
+  const geometry = await loadGeometry(url, filename);
   const material = new THREE.PointsMaterial({ color: 0xFFFFFF });
+  scene.remove(pointCloud);
   pointCloud = new THREE.Points(geometry, material);
   pointCloud.matrixAutoUpdate = false;
   scene.add(pointCloud);
@@ -593,7 +656,8 @@ function updateBVHMesh() {
   const attributes = pointCloud.geometry.attributes;
 
   const index = [];
-  const count = attributes.position.count;
+  const position = attributes.position.clone();
+  const count = position.count;
 
   for (let i = 0; i < count; i++)
     if (i % (1 << params.sparsity) == 0)
@@ -612,16 +676,19 @@ function updateBVHMesh() {
     scaleAttr.array.fill(baseScale * 0.0025);
   }
 
+  if (params.flipY) {
+    let m = position.itemSize;
+    for (let i = 0; i < count; i++)
+      position.array[i * m + 1] *= -1;
+  }
+
   bvhGeometry.setIndex(index);
-  bvhGeometry.setAttribute('position', attributes.position.clone());
+  bvhGeometry.setAttribute('position', position);
   bvhGeometry.setAttribute('scale', scaleAttr); // this is for computeTriangleBounds
   bvhGeometry.computeBoundsTree(getBVHOptions());
 
   scene.remove(bvhHelper);
-  scene.remove(bvhMesh);
-
   bvhMesh = new THREE.Mesh(bvhGeometry, new THREE.MeshBasicMaterial());
-
   bvhHelper = new MeshBVHHelper(bvhMesh, params.depth);
   bvhHelper.displayParents = true;
   bvhHelper.opacity = 0.1;
@@ -635,8 +702,10 @@ function rebuildGUI() {
   gui?.destroy();
   gui = new GUI();
   gui.onChange(() => {
-    resetRenderState();
+    clearRenderTargets();
   });
+
+  gui.add(params, 'open');
 
   const pointsFolder = gui.addFolder('points');
   pointsFolder.add(params, 'strategy', { CENTER, AVERAGE, SAH }).onChange(v => {
@@ -646,14 +715,13 @@ function rebuildGUI() {
     bvhHelper.update();
     updateBVH();
   });
-  pointsFolder.add(params, 'maxLeafTris', 1, 16, 1).onChange(v => {
-    console.time('computeBoundsTree');
-    bvh.geometry.computeBoundsTree(getBVHOptions());
-    console.timeEnd('computeBoundsTree');
-    bvhHelper.update();
-    updateBVH();
+  pointsFolder.add(params, 'maxDepth', 4, 64, 1).onChange(v => {
+    updateBVHMesh();
   });
-  pointsFolder.add(params, 'sparsity', 0, 12, 1).onChange(v => {
+  pointsFolder.add(params, 'maxLeafTris', 1, 16, 1).onChange(v => {
+    updateBVHMesh();
+  });
+  pointsFolder.add(params, 'sparsity', 0, 16, 1).onChange(v => {
     updateBVHMesh();
   });
   pointsFolder.open();
@@ -667,7 +735,7 @@ function rebuildGUI() {
     //displayFolder.add(params, 'maxSamplesPerSplat', 1, 4, 1).onChange(() => {
     //  raytracingPass.material.updateDefines();
     //});
-    displayFolder.add(params, 'maxSplatsPerRay', 1, 64, 1).onChange(() => {
+    displayFolder.add(params, 'maxSplatsPerRay', 1, 32, 1).onChange(() => {
       raytracingPass.material.updateDefines();
     });
     displayFolder.add(params, 'splatOpacity', -3.5, 3.5, 0.5);
@@ -675,18 +743,21 @@ function rebuildGUI() {
     displayFolder.add(params, 'splatScale', 0, 3, 0.25).onChange(() => {
       updateBVHMesh();
     });
+    displayFolder.add(params, 'flipY').onChange(() => {
+      updateBVHMesh();
+    });
     displayFolder.add(params, 'showCost').onChange(() => {
       raytracingPass.material.updateDefines();
     });
     displayFolder.add(params, 'shadows').onChange(() => {
+      if (params.shadows) frameId = 0;
       raytracingPass.material.updateDefines();
     });
   }
 }
 
 function updateBVH() {
-  //console.time('MeshBVH');
-
+  console.time('updateBVH');
   let geometry = bvhMesh.geometry;
   bvh = new MeshBVH(geometry, getBVHOptions());
 
@@ -703,8 +774,7 @@ function updateBVH() {
   }
 
   position.copy(position4);
-
-  //console.timeEnd('MeshBVH');
+  console.timeEnd('updateBVH');
 }
 
 function updateSplatColors(geometry) {
@@ -748,8 +818,8 @@ function updateShadowsData() {
   uniforms.cameraWorldMatrix.value.copy(camera.matrixWorld);
   uniforms.projectionMatrix.value.copy(camera.projectionMatrix);
   uniforms.modelMatrix.value.copy(pointCloud.matrixWorld);
-  uniforms.splatsData.value = new GSplatsDataUniformStruct();
-  uniforms.splatsData.value.shadowsData = dummyRT.texture;
+  uniforms.gsd.value = new GSplatsDataUniformStruct();
+  uniforms.gsd.value.shadowsData = dummyRT.texture;
   renderer.setRenderTarget(shadowsDataRT);
   shadowsPass.render(renderer);
 }
@@ -758,6 +828,9 @@ function render() {
 
   stats.update();
   requestAnimationFrame(render);
+
+  if (frameId < 0)
+    return;
 
   if (params.mode === 'points') {
 
@@ -781,19 +854,19 @@ function render() {
     uniforms.cameraWorldMatrix.value.copy(camera.matrixWorld);
     uniforms.projectionMatrix.value.copy(camera.projectionMatrix);
     uniforms.modelMatrix.value.copy(pointCloud.matrixWorld);
-    uniforms.pixelData.value = renderTargets[0].texture;
-    uniforms.splatsData.value = new GSplatsDataUniformStruct();
-    renderer.setRenderTarget(renderTargets[1]);
+    uniforms.pixelData.value = pixelsRT1.texture;
+    uniforms.gsd.value = new GSplatsDataUniformStruct();
+    renderer.setRenderTarget(pixelsRT2);
     raytracingPass.render(renderer);
 
     uniforms = drawPixelsPass.material.uniforms;
     uniforms.splatBrightness.value = 2 ** params.splatBrightness;
     uniforms.showCost.value = params.showCost;
-    uniforms.pixelData.value = renderTargets[1].texture;
+    uniforms.pixelData.value = pixelsRT2.texture;
     renderer.setRenderTarget(null);
     drawPixelsPass.render(renderer);
 
-    renderTargets = [renderTargets[1], renderTargets[0]];
+    [pixelsRT1, pixelsRT2] = [pixelsRT2, pixelsRT1];
     frameId++;
   }
 }

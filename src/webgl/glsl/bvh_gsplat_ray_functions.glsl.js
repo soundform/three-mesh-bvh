@@ -4,11 +4,7 @@ export const bvh_gsplat_ray_functions = /* glsl */`
 #define MAX_SPLATS_PER_RAY 1
 #endif
 
-#ifndef MAX_SAMPLES_PER_SPLAT
-#define MAX_SAMPLES_PER_SPLAT 1
-#endif
-
-float[MAX_SPLATS_PER_RAY] gSplatDists;
+vec2[MAX_SPLATS_PER_RAY] gSplatDists; // sorted by (tt.x + tt.y)*0.5
 uint[MAX_SPLATS_PER_RAY] gSplatIds;
 
 struct BVHIntersectResult {
@@ -49,25 +45,23 @@ void intersectSplats(
     uint splatId = uTexelFetch1D( indexAttr, id + offset ).x;
 		vec4 splat = texelFetch1D( positionAttr, splatId );
     vec2 tt = raySphere(rayOrigin - splat.xyz, rayDirection, splat.w);
+    float mid = dot(vec2(0.5), tt);
     
-    if (tt.x < tt.y) {
-      for (int s = 0; s < MAX_SAMPLES_PER_SPLAT; s++) {
-        float dist = mix(tt.x, tt.y, (float(s) + 0.5)/float(MAX_SAMPLES_PER_SPLAT));
+    if (tt.x < tt.y && tt.x + tt.y > 0. && mid < dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1])) {
+      // insert the new sample point into the sorted list
+      res.numSplats = min(res.numSplats + 1, MAX_SPLATS_PER_RAY);
 
-        if (dist > 0. && dist < gSplatDists[MAX_SPLATS_PER_RAY-1]) {
-          // insert the new sample point into the sorted list
-          res.numSplats = min(res.numSplats + 1, MAX_SPLATS_PER_RAY);
+      for (int k = res.numSplats - 1; k >= 0; k--) {
+        if (mid >= dot(vec2(0.5), gSplatDists[k]))
+          break;
 
-          for (int k = res.numSplats - 1; k >= 0 && dist < gSplatDists[k]; k--) {
-            if (k + 1 < MAX_SPLATS_PER_RAY) {
-              gSplatDists[k + 1] = gSplatDists[k];
-              gSplatIds[k + 1] = gSplatIds[k];
-            }
-
-            gSplatDists[k] = dist;
-            gSplatIds[k] = splatId;
-          }
+        if (k + 1 < MAX_SPLATS_PER_RAY) {
+          gSplatDists[k + 1] = gSplatDists[k];
+          gSplatIds[k + 1] = gSplatIds[k];
         }
+
+        gSplatDists[k] = tt;
+        gSplatIds[k] = splatId;
       }
     }
 	}
@@ -105,7 +99,7 @@ bool _bvhIntersectSplats(
 	stack[ 0 ] = 0u;
 
   for (int i = 0; i < MAX_SPLATS_PER_RAY; i++)
-	  gSplatDists[i] = INFINITY;
+	  gSplatDists[i] = vec2(INFINITY);
   res.numSplats = 0;
 
 	while ( ptr >= 0 && ptr < BVH_STACK_DEPTH ) {
@@ -113,7 +107,7 @@ bool _bvhIntersectSplats(
 		uint nodeId = stack[ ptr-- ];
     res.numLookupsBVH++;
     vec2 tt = rayBVH( rayOrigin, rayDirection, bvh_bvhBounds, nodeId );
-		if (tt.x >= tt.y || tt.x >= gSplatDists[MAX_SPLATS_PER_RAY-1])
+		if (tt.x >= tt.y || tt.x >= dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1]))
 			continue;
 
     res.numLookupsBVH++;
