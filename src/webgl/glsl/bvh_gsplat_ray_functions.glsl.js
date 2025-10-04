@@ -42,9 +42,8 @@ bool _bvhSearchSplats(
 
       for (uint id = 0u; id < count; id++) {
         uint splatId = uTexelFetch1D( bvh_index, id + offset ).x;
-        vec4 splat = texelFetch1D( bvh_position, splatId );
-
-        if (bvhVisitSplat(splatId, splat.xyz, splat.w))
+        
+        if (bvhVisitSplat(splatId))
           found = true;
       }
 		} else {

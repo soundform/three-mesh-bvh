@@ -95,15 +95,17 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
   
   // integrate(exp(-x*x))*2/sqrt(PI)
   float erfc(float x) {
+    if (x < -3.) return -1.; // optional
+    if (x > +3.) return +1.; // optional
     return sign(x)*sqrt(1. - exp2(-SQRT_PI*x*x)); // -1..1
   }
 
   // integrate(exp(-|pos + dir*t|^2), t=0..INF)*2/sqrt(PI)
   float erfc_3d(vec3 pos, vec3 dir) {
-    float b = dot(pos, -dir);       // -INF..INF
+    float b = dot(pos, dir);       // -INF..INF
     float h = dot(pos, pos) - b*b;  // 0..INF
-    float s = 1. + erfc(b);         // 0..2
-    return s*exp(-h)*SQRT_PI*0.5;   // 0..sqrt(PI)
+    float s = 1. - erfc(b);         // 0..2
+    return exp(-h)*s*SQRT_PI*0.5;   // 0..sqrt(PI)
   }
 `;
 
@@ -151,8 +153,9 @@ THREE.ShaderChunk['bvh_sorted_raycasting'] = /* glsl */`
     return tt.x < tt.y && tt.x < dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1]);
   }
 
-  bool bvhVisitSplat(uint splatId, vec3 splatPos, float splatRadius) {
-    vec2 tt = raySphere(bvhRay.origin - splatPos, bvhRay.dir, splatRadius);
+  bool bvhVisitSplat(uint splatId) {
+    vec4 splat = texelFetch1D( bvh.position, splatId );
+    vec2 tt = raySphere(bvhRay.origin - splat.xyz, bvhRay.dir, splat.w);
     float mid = dot(vec2(0.5), tt);
     
     if (tt.x >= tt.y || tt.x + tt.y <= 0. || mid >= dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1]))
@@ -296,34 +299,48 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
 THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   struct BVHRay { vec3 origin, dir; } bvhRay;
   const float MAX_TOTAL_DENSITY = -log(0.01);
-  float bvhTotalDensity;
+  float bvhSumShadow;
+  vec4 bvhSumColor;
 
   void bvhInitSearch() {
-    bvhTotalDensity = 0.;
+    bvhSumShadow = 0.;
+    bvhSumColor = vec4(0);
   }
 
   bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
-    if (bvhTotalDensity > MAX_TOTAL_DENSITY)
+    if (bvhSumShadow > MAX_TOTAL_DENSITY)
       return false;
     vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
     return tt.x < tt.y && tt.y > 0.;
   }
 
-  bool bvhVisitSplat(uint splatId, vec3 splatPos, float splatRadius) {
-    if (bvhTotalDensity > MAX_TOTAL_DENSITY)
+  bool bvhVisitSplat(uint splatId) {
+    if (bvhSumShadow > MAX_TOTAL_DENSITY)
       return false;
 
-    vec3 r = (bvhRay.origin - splatPos) / splatRadius;
-    if (dot(r, r) >= 1.)
-      return false;
+    vec4 splat = texelFetch1D( bvh.position, splatId );
+    vec3 r = (bvhRay.origin - splat.xyz) / splat.w;
+    float rd = dot(r, bvhRay.dir);
+    float r2 = dot(r, r);
+    float h2 = r2 - rd*rd;
 
-    // .w = total density along the ray
-    vec4 color = texelFetch1D(gsd.splatColors, splatId);
-    color.w *= gsd.splatOpacity;
-    color.w *= erfc_3d(r * gsd.splatScale / sqrt(2.0), bvhRay.dir);
+    // see if bvhRay intersects the splat
+    if (h2 < 1.) {
+      float scale = sqrt(2.0) / gsd.splatScale;
+      float shadow = erfc_3d(r/scale, bvhRay.dir);
+      vec4 color = texelFetch1D(gsd.splatColors, splatId);
+      shadow *= color.w * gsd.splatOpacity;
+      bvhSumShadow += shadow;
 
-    bvhTotalDensity += color.w;
-    return true;
+      // see if bvhRay.origin is inside the splat
+      if (r2 < 1.) {
+        float density = exp(-r2/(scale*scale));
+        density *= color.w * gsd.splatOpacity;
+        bvhSumColor += vec4(color.rgb, 1) * density;
+      }
+    }
+
+    return h2 < 1.;
   }
 `;
 
@@ -381,14 +398,15 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
         ${BVHShaderGLSL.bvh_struct_definitions}
 
         #include <ray_utils>
-        #include <bvh_sorted_raycasting>
-        
-        ${BVHShaderGLSL.bvh_gsplat_ray_functions}
-        
         #include <gsplats_data>
 
         uniform BVH bvh;
         uniform GSplatsData gsd;
+
+        #include <bvh_sorted_raycasting>
+        
+        ${BVHShaderGLSL.bvh_gsplat_ray_functions}
+
         uniform sampler2D pixelData;
 
         uniform mat4 cameraWorldMatrix;
@@ -528,7 +546,7 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
           bvhRay.origin = splat.xyz + bvhRay.dir * splat.w;
           bvhSearchSplats( bvh );
 
-          gl_FragColor.x = exp(-bvhTotalDensity);
+          gl_FragColor.x = exp(-bvhSumShadow);
           gl_FragColor.x += 0.2; // this should be ambient occlusion (AO) or global illumination (GI)
         }`
     });
