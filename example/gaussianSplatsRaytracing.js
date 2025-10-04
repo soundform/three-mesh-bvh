@@ -90,6 +90,94 @@ THREE.ShaderChunk['unpack_4x16'] = /* glsl */`
   #define UNPACK_4x16(v)  vec4(UNPACK_2x16(v.x), UNPACK_2x16(v.y))
 `;
 
+THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
+  const float SQRT_PI = sqrt(radians(180.));
+  
+  // integrate(exp(-x*x))*2/sqrt(PI)
+  float erfc(float x) {
+    return sign(x)*sqrt(1. - exp2(-SQRT_PI*x*x)); // -1..1
+  }
+
+  // integrate(exp(-|pos + dir*t|^2), t=0..INF)*2/sqrt(PI)
+  float erfc_3d(vec3 pos, vec3 dir) {
+    float b = dot(pos, -dir);       // -INF..INF
+    float h = dot(pos, pos) - b*b;  // 0..INF
+    float s = 1. + erfc(b);         // 0..2
+    return s*exp(-h)*SQRT_PI*0.5;   // 0..sqrt(PI)
+  }
+`;
+
+THREE.ShaderChunk['ray_utils'] = /* glsl */`
+  vec2 rayBox(vec3 ro, vec3 rd, vec3 aa, vec3 bb) {
+      vec3 ird = 1./rd;
+      vec3 tbot = ird*(aa - ro);
+      vec3 ttop = ird*(bb - ro);
+      vec3 tmin = min(ttop, tbot);
+      vec3 tmax = max(ttop, tbot);
+      vec2 tx = max(tmin.xx, tmin.yz);
+      vec2 ty = min(tmax.xx, tmax.yz);
+      vec2 tt;
+      tt.x = max(tx.x, tx.y);
+      tt.y = min(ty.x, ty.y);
+      return tt;
+  }
+
+  vec2 raySphere(vec3 ro, vec3 rd, float r) {
+      float b = dot(ro, rd);
+      float h = b*b + r*r - dot(ro, ro);
+      return h > 0. ? -b - sqrt(h)*vec2(1,-1) : vec2(0);
+  }
+`;
+
+THREE.ShaderChunk['bvh_sorted_raycasting'] = /* glsl */`
+  #ifndef MAX_SPLATS_PER_RAY
+  #define MAX_SPLATS_PER_RAY 1
+  #endif
+
+  struct BVHRay { vec3 origin, dir; } bvhRay;
+
+  vec2[MAX_SPLATS_PER_RAY] gSplatDists; // sorted by (tt.x + tt.y)*0.5
+  uint[MAX_SPLATS_PER_RAY] gSplatIds;
+  int gNumSplats; // 0..MAX_SPLATS_PER_RAY
+
+  void bvhInitSearch() {
+    for (int i = 0; i < MAX_SPLATS_PER_RAY; i++)
+      gSplatDists[i] = vec2(INFINITY);
+    gNumSplats = 0;
+  }
+
+  bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
+    vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
+    return tt.x < tt.y && tt.x < dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1]);
+  }
+
+  bool bvhVisitSplat(uint splatId, vec3 splatPos, float splatRadius) {
+    vec2 tt = raySphere(bvhRay.origin - splatPos, bvhRay.dir, splatRadius);
+    float mid = dot(vec2(0.5), tt);
+    
+    if (tt.x >= tt.y || tt.x + tt.y <= 0. || mid >= dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1]))
+      return false;
+
+    // insert the new sample point into the sorted list
+    gNumSplats = min(gNumSplats + 1, MAX_SPLATS_PER_RAY);
+
+    for (int k = gNumSplats - 1; k >= 0; k--) {
+      if (mid >= dot(vec2(0.5), gSplatDists[k]))
+        break;
+
+      if (k + 1 < MAX_SPLATS_PER_RAY) {
+        gSplatDists[k + 1] = gSplatDists[k];
+        gSplatIds[k + 1] = gSplatIds[k];
+      }
+
+      gSplatDists[k] = tt;
+      gSplatIds[k] = splatId;
+    }
+
+    return true;
+  }
+`;
+
 THREE.ShaderChunk['raycast_splats'] = /* glsl */`
   #ifndef SHOW_COST
   #define SHOW_COST 0
@@ -98,42 +186,29 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
   #ifndef USE_SHADOWS
   #define USE_SHADOWS 0
   #endif
-  
-  // integrate(exp(-x*x))*2/sqrt(PI) = -1..1
-  float erfc(float x) {
-      return sign(x)*sqrt(1. - exp2(-1.787776*x*x));
-  }
-
-  // integrate(exp(-sqr(pos + dir*t)), t=0..INF)*2/sqrt(PI) = 0..2
-  float erfc_3d(vec3 pos, vec3 dir) {
-    float b = dot(pos, -dir);       // -INF..INF
-    float h = dot(pos, pos) - b*b;  // 0..INF
-    float s = 1. + erfc(b);         // 0..2
-    return s*exp(-h);
-  }
 
   float raycastSplats(vec3 rayOrigin, vec3 rayDir, inout vec4 rgba) {
-    BVHIntersectResult res;
-    bvhIntersectSplats( bvh, rayOrigin, rayDir, res );
+    bvhRay = BVHRay( rayOrigin, rayDir );
+    bvhSearchSplats( bvh );
 
     float eps = 0.;
 
     #if SHOW_COST
       
-      vec4 cost = vec4(res.numLookupsBVH, res.numLookupsSplats, res.numSplats, 0);
-      cost /= float(gsd.splatsCount)/1e2;
+      vec4 cost = vec4(bvhStats.numLookupsBVH, bvhStats.numLookupsSplats, gNumSplats, 0);
+      cost /= 1e4;
       // rgba.zw are reserved for raytracing metadata
       cost += UNPACK_4x16(rgba.xy);
       rgba.xy = PACK_4x16(cost);
 
     #else
       
-      if (res.numSplats == 0)
+      if (gNumSplats == 0)
         return INFINITY;
 
       vec2[MAX_SPLATS_PER_RAY*2] pts; // sorted by .x
 
-      for (int k = 0; k < res.numSplats; k++) {
+      for (int k = 0; k < gNumSplats; k++) {
         vec2 tt = gSplatDists[k];
 
         for (int i = 0; i < 2; i++) {
@@ -152,7 +227,7 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
 
       int bitmask = 0;
 
-      for (int k = 0; k < res.numSplats*2 - 1; k++) {
+      for (int k = 0; k < gNumSplats*2 - 1; k++) {
         int b = int(pts[k].y);
         if (b > 0) bitmask |=  (1 << (+b - 1));
         if (b < 0) bitmask &= ~(1 << (-b - 1));
@@ -160,7 +235,7 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
 
         vec2 segment = vec2(pts[k].x, pts[k+1].x);
 
-        for (int i = 0; i < res.numSplats; i++) {
+        for (int i = 0; i < gNumSplats; i++) {
           if ((bitmask & (1 << i)) == 0)
             continue;
 
@@ -189,7 +264,7 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
           #if USE_SHADOWS
 
             float luminance = texelFetch1D(gsd.shadowsData, splatId).x;
-            float fog = erfc_3d(midpoint/scale, lightDir)*0.5; // 0..1
+            float fog = erfc_3d(midpoint/scale, lightDir); // 0..sqrt(PI)
             color.rgb *= luminance * exp(-fog * color.w);
 
           #endif
@@ -198,22 +273,57 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
           //color.w *= exp(-dot(midpoint/scale, midpoint/scale));
           float fx = erfc_3d((rayOrigin - splat.xyz + rayDir*seg.x)/scale, rayDir);
           float fy = erfc_3d((rayOrigin - splat.xyz + rayDir*seg.y)/scale, rayDir);
-          color.w *= max(fx - fy, 0.)*0.5; // 0..1
+          color.w *= max(fx - fy, 0.); // 0..sqrt(PI)
 
-          color.rgb *= color.w;
+          color.rgb *= 1. - exp(-color.w);
           rgba.rgb += color.rgb * exp(-rgba.w);
           rgba.w += color.w;
 
-          if (rgba.w > 4.0)
-            return INFINITY;
+          const float MAX_DENSITY = -log(0.01);
+          if (rgba.w > MAX_DENSITY) return INFINITY;
         }
       }
 
     #endif
     
-    if (res.numSplats < MAX_SPLATS_PER_RAY)
+    if (gNumSplats < MAX_SPLATS_PER_RAY)
       return INFINITY;
-    return eps + dot(vec2(0.5), gSplatDists[res.numSplats - 1]);
+    
+    return eps + dot(vec2(0.5), gSplatDists[gNumSplats - 1]);
+  }
+`;
+
+THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
+  struct BVHRay { vec3 origin, dir; } bvhRay;
+  const float MAX_TOTAL_DENSITY = -log(0.01);
+  float bvhTotalDensity;
+
+  void bvhInitSearch() {
+    bvhTotalDensity = 0.;
+  }
+
+  bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
+    if (bvhTotalDensity > MAX_TOTAL_DENSITY)
+      return false;
+    vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
+    return tt.x < tt.y && tt.y > 0.;
+  }
+
+  bool bvhVisitSplat(uint splatId, vec3 splatPos, float splatRadius) {
+    if (bvhTotalDensity > MAX_TOTAL_DENSITY)
+      return false;
+
+    vec3 r = (bvhRay.origin - splatPos) / splatRadius;
+    if (dot(r, r) >= 1.)
+      return false;
+
+    // .w = total density along the ray
+    vec4 color = texelFetch1D(gsd.splatColors, splatId);
+    color.w *= gsd.splatOpacity;
+    color.w *= erfc_3d(r * gsd.splatScale / sqrt(2.0), bvhRay.dir);
+
+    bvhTotalDensity += color.w;
+    return true;
   }
 `;
 
@@ -269,6 +379,10 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
 
         ${BVHShaderGLSL.common_functions}
         ${BVHShaderGLSL.bvh_struct_definitions}
+
+        #include <ray_utils>
+        #include <bvh_sorted_raycasting>
+        
         ${BVHShaderGLSL.bvh_gsplat_ray_functions}
         
         #include <gsplats_data>
@@ -287,6 +401,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
         #include <common>
         #include <yuv_rgb>
         #include <unpack_4x16>
+        #include <gaussian_utils>
         #include <raycast_splats>
 
         void main() {
@@ -352,9 +467,7 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
 
       defines: {
 
-        USE_SHADOWS: 0,
         BVH_STACK_DEPTH: params.maxDepth,
-        MAX_SPLATS_PER_RAY: 16,
 
       },
 
@@ -384,12 +497,17 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
 
         ${BVHShaderGLSL.common_functions}
         ${BVHShaderGLSL.bvh_struct_definitions}
-        ${BVHShaderGLSL.bvh_gsplat_ray_functions}
 
+        #include <ray_utils>
+        #include <gaussian_utils>
         #include <gsplats_data>
 
         uniform BVH bvh;
         uniform GSplatsData gsd;
+
+        #include <bvh_shadows_raycasting>
+
+        ${BVHShaderGLSL.bvh_gsplat_ray_functions}
 
         uniform mat4 cameraWorldMatrix;
         uniform mat4 projectionMatrix;
@@ -399,7 +517,6 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
 
         #include <common>
         #include <unpack_4x16>
-        #include <raycast_splats>
 
         void main() {
           ivec2 size = textureSize(bvh.position, 0);
@@ -407,11 +524,11 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
           uint splatId = uint(uv.x + uv.y * size.x);
           vec4 splat = texelFetch1D( bvh.position, splatId );
 
-          vec3 dir = lightDir; // (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
+          bvhRay.dir = lightDir; // (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
+          bvhRay.origin = splat.xyz + bvhRay.dir * splat.w;
+          bvhSearchSplats( bvh );
 
-          gl_FragColor = vec4(0);
-          raycastSplats(splat.xyz + dir*splat.w, dir, gl_FragColor);
-          gl_FragColor.x = max(exp(-gl_FragColor.w), 0.0);
+          gl_FragColor.x = exp(-bvhTotalDensity);
           gl_FragColor.x += 0.2; // this should be ambient occlusion (AO) or global illumination (GI)
         }`
     });
@@ -709,10 +826,10 @@ function rebuildGUI() {
 
   const pointsFolder = gui.addFolder('points');
   pointsFolder.add(params, 'strategy', { CENTER, AVERAGE, SAH }).onChange(v => {
-    console.time('computeBoundsTree');
-    bvh.geometry.computeBoundsTree(getBVHOptions());
-    console.timeEnd('computeBoundsTree');
-    bvhHelper.update();
+    //console.time('computeBoundsTree');
+    //bvh.geometry.computeBoundsTree(getBVHOptions());
+    //console.timeEnd('computeBoundsTree');
+    //bvhHelper.update();
     updateBVH();
   });
   pointsFolder.add(params, 'maxDepth', 4, 64, 1).onChange(v => {
@@ -773,6 +890,8 @@ function updateBVH() {
       position4.array[i * 4 + j] = position.array[i * position.itemSize + j];
   }
 
+  // It would be better if MeshBVH supported
+  // the 'position' attribute with 4 elements (xyzw).
   position.copy(position4);
   console.timeEnd('updateBVH');
 }
@@ -812,7 +931,8 @@ function updateShadowsData() {
 
   if (!shadowsDataRT) {
     let { width, height } = uniforms.bvh.value.position.image;
-    shadowsDataRT = new THREE.WebGLRenderTarget(width, height, { format: THREE.RedFormat, type: THREE.HalfFloatType });
+    shadowsDataRT = new THREE.WebGLRenderTarget(width, height, 
+      { format: THREE.RedFormat, type: THREE.HalfFloatType });
   }
 
   uniforms.cameraWorldMatrix.value.copy(camera.matrixWorld);

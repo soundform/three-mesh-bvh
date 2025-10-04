@@ -1,135 +1,58 @@
 export const bvh_gsplat_ray_functions = /* glsl */`
 
-#ifndef MAX_SPLATS_PER_RAY
-#define MAX_SPLATS_PER_RAY 1
-#endif
-
-vec2[MAX_SPLATS_PER_RAY] gSplatDists; // sorted by (tt.x + tt.y)*0.5
-uint[MAX_SPLATS_PER_RAY] gSplatIds;
-
-struct BVHIntersectResult {
-  int numSplats; // 0..MAX_SPLATS_PER_RAY
+struct BVHStats {
   uint numLookupsBVH;
   uint numLookupsSplats;
-};
-
-vec2 rayBox(vec3 ro, vec3 rd, vec3 aa, vec3 bb) {
-    vec3 ird = 1./rd;
-    vec3 tbot = ird*(aa - ro);
-    vec3 ttop = ird*(bb - ro);
-    vec3 tmin = min(ttop, tbot);
-    vec3 tmax = max(ttop, tbot);
-    vec2 tx = max(tmin.xx, tmin.yz);
-    vec2 ty = min(tmax.xx, tmax.yz);
-    vec2 tt;
-    tt.x = max(tx.x, tx.y);
-    tt.y = min(ty.x, ty.y);
-    return tt;
-}
-
-vec2 raySphere(vec3 ro, vec3 rd, float r) {
-    float b = dot(ro, rd);
-    float h = b*b + r*r - dot(ro, ro);
-    return h > 0. ? -b - sqrt(h)*vec2(1,-1) : vec2(0);
-}
-
-void intersectSplats(
-	sampler2D positionAttr, usampler2D indexAttr, uint offset, uint count,
-	vec3 rayOrigin, vec3 rayDirection,
-	inout BVHIntersectResult res
-) {
-  res.numLookupsSplats += count;
-
-  for (uint id = 0u; id < count; id++) {
-		
-    uint splatId = uTexelFetch1D( indexAttr, id + offset ).x;
-		vec4 splat = texelFetch1D( positionAttr, splatId );
-    vec2 tt = raySphere(rayOrigin - splat.xyz, rayDirection, splat.w);
-    float mid = dot(vec2(0.5), tt);
-    
-    if (tt.x < tt.y && tt.x + tt.y > 0. && mid < dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1])) {
-      // insert the new sample point into the sorted list
-      res.numSplats = min(res.numSplats + 1, MAX_SPLATS_PER_RAY);
-
-      for (int k = res.numSplats - 1; k >= 0; k--) {
-        if (mid >= dot(vec2(0.5), gSplatDists[k]))
-          break;
-
-        if (k + 1 < MAX_SPLATS_PER_RAY) {
-          gSplatDists[k + 1] = gSplatDists[k];
-          gSplatIds[k + 1] = gSplatIds[k];
-        }
-
-        gSplatDists[k] = tt;
-        gSplatIds[k] = splatId;
-      }
-    }
-	}
-}
-
-vec2 rayBVH( vec3 rayOrigin, vec3 rayDirection, sampler2D bvhBounds, uint nodeId ) {
-	uint cni2 = nodeId * 2u;
-	vec3 boundsMin = texelFetch1D( bvhBounds, cni2 + 0u ).xyz;
-	vec3 boundsMax = texelFetch1D( bvhBounds, cni2 + 1u ).xyz;
-  return rayBox( rayOrigin, rayDirection, boundsMin, boundsMax );
-}
+} bvhStats;
 
 // use a macro to hide the fact that we need to expand the struct into separate fields
 #define\
-	bvhIntersectSplats(\
-		bvh,\
-		rayOrigin, rayDirection, res\
-	)\
-	_bvhIntersectSplats(\
-		bvh.position, bvh.index, bvh.bvhBounds, bvh.bvhContents,\
-		rayOrigin, rayDirection, res\
-	)
+	bvhSearchSplats(bvh)\
+	_bvhSearchSplats(bvh.position, bvh.index, bvh.bvhBounds, bvh.bvhContents)
 
-bool _bvhIntersectSplats(
-	// bvh info
-	sampler2D bvh_position, usampler2D bvh_index, sampler2D bvh_bvhBounds, usampler2D bvh_bvhContents,
-
-	// ray
-	vec3 rayOrigin, vec3 rayDirection,
-	inout BVHIntersectResult res
+bool _bvhSearchSplats(
+	sampler2D bvh_position, usampler2D bvh_index, sampler2D bvh_bvhBounds, usampler2D bvh_bvhContents
 ) {
-
 	int ptr = 0;
 	uint stack[ BVH_STACK_DEPTH ];
 	stack[ 0 ] = 0u;
+  bool found = false;
+  bvhStats = BVHStats(0u, 0u);
 
-  for (int i = 0; i < MAX_SPLATS_PER_RAY; i++)
-	  gSplatDists[i] = vec2(INFINITY);
-  res.numSplats = 0;
+  bvhInitSearch();
 
 	while ( ptr >= 0 && ptr < BVH_STACK_DEPTH ) {
-
 		uint nodeId = stack[ ptr-- ];
-    res.numLookupsBVH++;
-    vec2 tt = rayBVH( rayOrigin, rayDirection, bvh_bvhBounds, nodeId );
-		if (tt.x >= tt.y || tt.x >= dot(vec2(0.5), gSplatDists[MAX_SPLATS_PER_RAY-1]))
-			continue;
+    vec3 boundsMin = texelFetch1D( bvh_bvhBounds, nodeId * 2u + 0u ).xyz;
+    vec3 boundsMax = texelFetch1D( bvh_bvhBounds, nodeId * 2u + 1u ).xyz;
+    bvhStats.numLookupsBVH++;
 
-    res.numLookupsBVH++;
+    if (!bvhVisitBoundingBox(boundsMin, boundsMax))
+      continue;
+
 		uvec2 boundsInfo = uTexelFetch1D( bvh_bvhContents, nodeId ).xy;
 		bool isLeaf = bool( boundsInfo.x & 0xffff0000u );
+    bvhStats.numLookupsBVH++;
 
 		if ( isLeaf ) {
-
 			uint count = boundsInfo.x & 0x0000ffffu;
 			uint offset = boundsInfo.y;
 
-			intersectSplats(
-				bvh_position, bvh_index, offset, count,
-				rayOrigin, rayDirection, res);
+      bvhStats.numLookupsSplats += count;
 
+      for (uint id = 0u; id < count; id++) {
+        uint splatId = uTexelFetch1D( bvh_index, id + offset ).x;
+        vec4 splat = texelFetch1D( bvh_position, splatId );
+
+        if (bvhVisitSplat(splatId, splat.xyz, splat.w))
+          found = true;
+      }
 		} else {
-
 			uint leftIndex = nodeId + 1u;
 			uint splitAxis = boundsInfo.x & 0x0000ffffu;
 			uint rightIndex = boundsInfo.y;
 
-			bool leftToRight = rayDirection[ splitAxis ] >= 0.0;
+			bool leftToRight = bvhRay.dir[ splitAxis ] >= 0.0;
 			uint c1 = leftToRight ? leftIndex : rightIndex;
 			uint c2 = leftToRight ? rightIndex : leftIndex;
 
@@ -138,6 +61,6 @@ bool _bvhIntersectSplats(
 		}
 	}
 
-  return res.numSplats > 0;
+  return found;
 }
 `;
