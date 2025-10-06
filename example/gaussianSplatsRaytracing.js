@@ -28,7 +28,7 @@ const params = {
   sparsity: 0,
   splatScale: 1.5, // exp2, same as maxStdDev in https://sparkjs.dev
   splatOpacity: 0, // exp2, density that absorbs light 
-  splatBrightness: 0, // exp2, luminance that emits light
+  brightness: 0, // exp2, brightness of sunlight or of the splats themselves
   maxSplatsPerRay: 8,
   rayStep: -2.5, // 10**-2.5
   flipY: false,
@@ -62,7 +62,7 @@ class GSplatsDataUniformStruct {
   splatsCount = pointCloud.geometry.attributes.position.count;
   splatScale = 2 ** params.splatScale;
   splatOpacity = 2 ** params.splatOpacity;
-  splatBrightness = 2 ** params.splatBrightness;
+  brightness = 2 ** params.brightness;
   splatColors = splatColorsRT.texture;
   shadowsData = shadowsDataRT?.texture || dummyRT.texture;
 }
@@ -73,14 +73,14 @@ THREE.ShaderChunk['yuv_rgb'] = /* glsl */`
 `;
 
 THREE.ShaderChunk['gsplats_data'] = /* glsl */`
-  #define USE_GAMMA 0
+  #define USE_GAMMA 1
 
   struct GSplatsData {
     int splatsCount;
     
     float splatScale;
     float splatOpacity;
-    float splatBrightness;
+    float brightness;
     
     sampler2D splatColors;
     sampler2D shadowsData;
@@ -272,9 +272,14 @@ THREE.ShaderChunk['raycast_splats'] = /* glsl */`
           #if USE_SHADOWS
 
             float luminance = 1. - texelFetch1D(gsd.shadowsData, splatId).x;
+            luminance *= gsd.brightness;
             luminance += 0.2; // this should be ambient occlusion (AO) or global illumination (GI)
             float fog = erfc_3d(midpoint/scale, lightDir, 0., INFINITY); // 0..sqrt(PI)
             color.rgb *= luminance * exp(-fog);
+
+          #else
+
+            color.rgb *= gsd.brightness;
 
           #endif
 
@@ -617,10 +622,10 @@ class ShadeSplatMaterial extends THREE.ShaderMaterial {
           bvhSearchSplats( bvh );
 
           if (bvhSumColor.w > 0.) {
-            float luminance = 1.0;
+            float luminance = gsd.brightness;
 
             #if USE_SHADOWS
-              luminance = exp(-bvhSumShadow);
+              luminance *= exp(-bvhSumShadow);
               luminance += 0.2; // ambient occlusion (AO) or global illumination (GI)
             #endif
 
@@ -864,7 +869,6 @@ class DrawPixelsMaterial extends THREE.ShaderMaterial {
   constructor() {
     super({
       uniforms: {
-        splatBrightness: { value: 1 },
         showCost: { value: true },
         showProgress: { value: false },
         pixelData: { value: null },
@@ -882,7 +886,6 @@ class DrawPixelsMaterial extends THREE.ShaderMaterial {
         in vec2 vUv;
 
         uniform sampler2D pixelData;
-        uniform float splatBrightness;
         uniform bool showCost;
         uniform bool showProgress;
 
@@ -905,7 +908,7 @@ class DrawPixelsMaterial extends THREE.ShaderMaterial {
             o = mat4x4(9,3,1,0, 3,1,9,0, 1,9,3,0, 3,9,1,0) * cost;
           } else {
             vec3 yuv = vec3(o.x, UNPACK_2x16(o.y)); // Y'UV
-            o.rgb = YUV_RGB * yuv * splatBrightness;
+            o.rgb = YUV_RGB * yuv;
             #if USE_GAMMA
               o.rgb = sqrt(o.rgb); // gamma correction
             #endif
@@ -1185,7 +1188,7 @@ function rebuildGUI() {
     updateBVHMesh();
   });
   pointsFolder.add(params, 'splatOpacity', -3, 10, 0.5);
-  pointsFolder.add(params, 'splatBrightness', -3, 10, 0.5);
+  pointsFolder.add(params, 'brightness', -5, 5, 0.25);
   pointsFolder.add(params, 'splatScale', 0, 3, 0.25).onChange(() => {
     updateBVHMesh();
   });
@@ -1360,7 +1363,6 @@ function render() {
     }
 
     uniforms = drawPixelsPass.material.uniforms;
-    uniforms.splatBrightness.value = 2 ** params.splatBrightness;
     uniforms.showCost.value = params.showCost;
     uniforms.showProgress.value = params.showProgress;
     uniforms.pixelData.value = pixelsRT2.texture;
