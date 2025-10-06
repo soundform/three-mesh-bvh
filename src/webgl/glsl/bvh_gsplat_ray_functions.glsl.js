@@ -1,6 +1,7 @@
 export const bvh_gsplat_ray_functions = /* glsl */`
 
 struct BVHStats {
+  uint numSplats;
   uint numLookupsBVH;
   uint numLookupsSplats;
 } bvhStats;
@@ -17,7 +18,7 @@ bool _bvhSearchSplats(
 	uint stack[ BVH_STACK_DEPTH ];
 	stack[ 0 ] = 0u;
   bool found = false;
-  bvhStats = BVHStats(0u, 0u);
+  bvhStats = BVHStats(0u, 0u, 0u);
 
   bvhInitSearch();
 
@@ -42,9 +43,11 @@ bool _bvhSearchSplats(
 
       for (uint id = 0u; id < count; id++) {
         uint splatId = uTexelFetch1D( bvh_index, id + offset ).x;
-        
-        if (bvhVisitSplat(splatId))
+
+        if (bvhVisitSplat(splatId)) {
           found = true;
+          bvhStats.numSplats++;
+        }
       }
 		} else {
 			uint leftIndex = nodeId + 1u;
