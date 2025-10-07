@@ -22,6 +22,7 @@ const params = {
   open: () => selectScene(),
 
   mode: 'points',
+  render: true,
   strategy: SAH,
   maxDepth: 32,
   maxLeafTris: 8,
@@ -35,7 +36,6 @@ const params = {
   shadows: false,
   showCost: false,
   showProgress: false,
-  raycasting: true,
 };
 
 const getBVHOptions = () => ({
@@ -44,7 +44,7 @@ const getBVHOptions = () => ({
   maxLeafTris: params.maxLeafTris,
 });
 
-let renderer, camera, scene, gui, stats, outputContainer;
+let renderer, camera, scene, orbit, gui, stats, outputContainer;
 let bvh, bvhMesh, bvhHelper, pointCloud;
 let raytracingPass, nextSplatPass, shadeSplatPass, drawPixelsPass, shadowsPass;
 let pixelsRT1, pixelsRT2, shadowsDataRT, splatColorsRT;
@@ -96,6 +96,11 @@ THREE.ShaderChunk['unpack_4x16'] = /* glsl */`
 
 THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
   const float SQRT_PI = sqrt(radians(180.));
+  const float SQRT_2 = sqrt(2.0);
+
+  float gaussian3d(vec3 r) {
+    return exp(-dot(r,r));
+  }
   
   // integrate(exp(-x*x))*2/sqrt(PI)
   float erfc(float x) {
@@ -344,27 +349,34 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     float rd = dot(r, bvhRay.dir);
     float r2 = dot(r, r);
     float h2 = r2 - rd*rd;
-    float scale = sqrt(2.0) / gsd.splatScale;
+    float scale = SQRT_2 / gsd.splatScale;
 
     // see if bvhRay intersects the splat
     if (h2 < 1.) {
 
       #if USE_SHADOWS
       
-        float fog = erfc_3d(r/scale, bvhRay.dir, 0., INFINITY);
-        fog *= scale;
+        // The proper integral should be:
+        //    erfc_3d((origin - splat.xyz)/splat.w/scale, dir)*splat.w*scale
+        // However rasterizers implicitly scale opacity of splats by their size,
+        // and hence the splat.w multiplier is omitted here.
+        float fog = erfc_3d(r/scale, bvhRay.dir, 0., INFINITY)*scale*splat.w;
         vec4 color = texelFetch1D(gsd.splatColors, splatId);
-        color.w *= gsd.splatOpacity;
+        color.w *= gsd.splatOpacity/splat.w;
         bvhSumShadow += fog * color.w;
 
       #endif
 
       // see if bvhRay.origin is inside the splat
       if (r2 < 1.) {
-        float density = exp(-r2/(scale*scale));
-        density /= splat.w;
+        // Rasterizers render small splats with the same opacity as large splats,
+        // but if the splats were to be integrated properly, the opacity would have
+        // to be scaled by the splat size: integrate(exp(-1/2 * |r/s|^2)) = sqrt(2*PI)*s
+        // This means that rasterizers implicitly scale the density of splats and this
+        // has to be accounted for here.
+        float density = gaussian3d(r/scale);
         vec4 color = texelFetch1D(gsd.splatColors, splatId);
-        color.w *= gsd.splatOpacity;
+        color.w *= gsd.splatOpacity/splat.w;
         
         #if USE_GAMMA
           color.rgb *= color.rgb;
@@ -617,7 +629,7 @@ class ShadeSplatMaterial extends THREE.ShaderMaterial {
           vec3 yuv = vec3(rayData.x, UNPACK_2x16(rayData.y)); // Y'UV
           vec4 color = vec4(YUV_RGB*yuv, rayData.a); // RGBA
 
-          bvhRay.dir = lightDir; // (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
+          bvhRay.dir = (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
           bvhRay.origin = rayOrigin + rayDir * abs(rayData.z);
           bvhSearchSplats( bvh );
 
@@ -855,7 +867,7 @@ class ComputeShadowsMaterial extends THREE.ShaderMaterial {
           uint splatId = uint(uv.x + uv.y * size.x);
           vec4 splat = texelFetch1D( bvh.position, splatId );
 
-          bvhRay.dir = lightDir; // (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
+          bvhRay.dir = lightDir;
           bvhRay.origin = splat.xyz + bvhRay.dir * splat.w;
           bvhSearchSplats( bvh );
 
@@ -987,8 +999,10 @@ async function init() {
   camera.far = 100;
   camera.updateProjectionMatrix();
 
-  let orbit = new OrbitControls(camera, renderer.domElement);
+  orbit = new OrbitControls(camera, renderer.domElement);
   orbit.addEventListener('change', () => clearRenderTargets());
+  orbit.addEventListener('start', () => { orbit.interacting = true; });
+  orbit.addEventListener('end', () => { orbit.interacting = false; });
 
   pixelsRT1 = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType });
   pixelsRT2 = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType });
@@ -1012,11 +1026,6 @@ async function init() {
   updateRenderSize();
   window.addEventListener('resize',
     () => updateRenderSize(), false);
-
-  document.addEventListener('keypress', (e) => {
-    if (e.code == 'Space')
-      orbit.enabled = !orbit.enabled;
-  });
 }
 
 function updateRenderSize() {
@@ -1161,35 +1170,26 @@ function updateBVHMesh() {
 function rebuildGUI() {
   gui?.destroy();
   gui = new GUI();
-  gui.onChange(() => {
-    clearRenderTargets();
+  gui.onChange((e) => {
+    if (e.property != 'showProgress' && e.property != 'render')
+      clearRenderTargets();
   });
 
   gui.add(params, 'open');
 
-  const pointsFolder = gui.addFolder('points');
-  pointsFolder.add(params, 'strategy', { CENTER, AVERAGE, SAH }).onChange(v => {
-    //console.time('computeBoundsTree');
-    //bvh.geometry.computeBoundsTree(getBVHOptions());
-    //console.timeEnd('computeBoundsTree');
-    //bvhHelper.update();
-    updateBVH();
+  gui.add(params, 'render').onChange(() => {
+    orbit.enabled = params.render;
   });
+
+  const pointsFolder = gui.addFolder('points');
+
   pointsFolder.add(params, 'maxDepth', 4, 64, 1).onChange(v => {
     shadowsPass.material.updateDefines();
     nextSplatPass.material.updateDefines();
     shadeSplatPass.material.updateDefines();
     updateBVHMesh();
   });
-  pointsFolder.add(params, 'maxLeafTris', 1, 16, 1).onChange(v => {
-    updateBVHMesh();
-  });
   pointsFolder.add(params, 'sparsity', 0, 16, 1).onChange(v => {
-    updateBVHMesh();
-  });
-  pointsFolder.add(params, 'splatOpacity', -3, 10, 0.5);
-  pointsFolder.add(params, 'brightness', -5, 5, 0.25);
-  pointsFolder.add(params, 'splatScale', 0, 3, 0.25).onChange(() => {
     updateBVHMesh();
   });
   pointsFolder.add(params, 'flipY').onChange(() => {
@@ -1198,31 +1198,41 @@ function rebuildGUI() {
   pointsFolder.open();
 
   const displayFolder = gui.addFolder('display');
-  displayFolder.add(params, 'mode', ['points', 'splats']).onChange(v => {
+  displayFolder.add(params, 'mode', ['points', 'raytracing', 'raymarching']).onChange(v => {
     rebuildGUI();
   });
 
-  if (params.mode === 'splats') {
+  if (params.mode === 'raytracing') {
     displayFolder.add(params, 'maxSplatsPerRay', 1, 32, 1).onChange(() => {
       raytracingPass.material.updateDefines();
     });
+  }
 
+  if (params.mode === 'raymarching') {
     displayFolder.add(params, 'rayStep', -5, -1, 0.5).onChange(() => {
       nextSplatPass.material.updateDefines();
       shadeSplatPass.material.updateDefines();
     });
-    displayFolder.add(params, 'showCost').onChange(() => {
-      raytracingPass.material.updateDefines();
-      nextSplatPass.material.updateDefines();
-      shadeSplatPass.material.updateDefines();
+  }
+
+  if (params.mode == 'raytracing' || params.mode == 'raymarching') {
+    pointsFolder.add(params, 'splatOpacity', -3, 10, 0.5);
+    pointsFolder.add(params, 'brightness', -5, 5, 0.25);
+    pointsFolder.add(params, 'splatScale', 0, 3, 0.25).onChange(() => {
+      updateBVHMesh();
     });
-    displayFolder.add(params, 'showProgress');
+
     displayFolder.add(params, 'shadows').onChange(() => {
       if (params.shadows) frameId = 0;
       raytracingPass.material.updateDefines();
       shadeSplatPass.material.updateDefines();
     });
-    displayFolder.add(params, 'raycasting');
+    displayFolder.add(params, 'showProgress');
+    displayFolder.add(params, 'showCost').onChange(() => {
+      raytracingPass.material.updateDefines();
+      nextSplatPass.material.updateDefines();
+      shadeSplatPass.material.updateDefines();
+    });
   }
 }
 
@@ -1301,31 +1311,32 @@ function updateShadowsData() {
 
 function render() {
 
-  stats.update();
   requestAnimationFrame(render);
 
-  if (frameId < 0)
+  if (frameId < 0 || !params.render)
     return;
 
-  if (params.mode === 'points') {
+  stats.update();
+
+  if (params.mode === 'points' || orbit.interacting) {
 
     if (!pointCloud) return;
     pointCloud.material.size = 0.005;
     renderer.setRenderTarget(null);
     renderer.render(scene, camera);
 
-  } else if (params.mode === 'splats') {
+  } else if (params.mode === 'raytracing' || params.mode == 'raymarching') {
     if (!bvh) return;
 
     camera.updateMatrixWorld();
     pointCloud.updateMatrixWorld();
 
-    if (frameId == 0 && params.shadows && params.raycasting && !shadowsDataRT)
-      updateShadowsData();
-
     let uniforms;
 
-    if (params.raycasting) {
+    if (params.mode == 'raytracing') {
+      if (frameId == 0 && params.shadows && !shadowsDataRT)
+        updateShadowsData();
+
       uniforms = raytracingPass.material.uniforms;
       uniforms.bvh.value.updateFrom(bvh);
       uniforms.frameId.value = frameId;
@@ -1336,7 +1347,9 @@ function render() {
       uniforms.gsd.value = new GSplatsDataUniformStruct();
       renderer.setRenderTarget(pixelsRT2);
       raytracingPass.render(renderer);
-    } else {
+    }
+
+    if (params.mode == 'raymarching') {
       uniforms = nextSplatPass.material.uniforms;
       uniforms.bvh.value.updateFrom(bvh);
       uniforms.gsd.value = new GSplatsDataUniformStruct();
