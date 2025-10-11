@@ -34,7 +34,7 @@ const params = {
   brightness: 0, // exp2, brightness of sunlight or of the splats themselves
   ambientLight: -6, // exp2
   maxSplatsPerRay: 8,
-  rayStep: -2.5, // exp10
+  rayStep: -2.0, // exp10
   fogDensity: -3.5, // exp10
   shadows: false,
   monochrome: false,
@@ -52,7 +52,7 @@ let renderer, camera, scene, orbit, gui, stats, outputContainer;
 let bvh, bvhMesh, bvhHelper, pointCloud;
 let raytracingPass, nextSplatPass, raymarchingPass, outputPass;
 let pixelsRT1, pixelsRT2, splatColorsRT;
-let lightPos = new THREE.Vector3(1, 1, -1).multiplyScalar(1e6);
+let lightPos = new THREE.Vector3(1, 2, 3).multiplyScalar(1e3);
 let frameId = 0;
 
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
@@ -109,27 +109,36 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
   const float SQRT_2 = sqrt(2.0);
 
   float gaussian3d(vec3 r) {
-    float r2 = dot(r,r);
-    return r2 < 9.5 ? exp(-r2) : 0.;
+    return exp(-dot(r, r));
   }
   
-  // integrate(exp(-x*x))*2/sqrt(PI)
+  // integrate( exp(-x*x))*2/sqrt(PI), 0..x )
   // https://en.wikipedia.org/wiki/Error_function
   float erfc(float x) {
-    if (x < -3.5) return -1.; // optional
-    if (x > +3.5) return +1.; // optional
+    if (x < -3.5) return -1.;
+    if (x > +3.5) return +1.;
     return sign(x)*sqrt(1. - exp2(-SQRT_PI*x*x)); // -1..1
   }
 
-  // integrate(exp(-|pos + dir*t|^2))*2/sqrt(PI)
+  // 2/sqrt(PI) * integrate( exp(-|pos + dir*t|^2), t=0..len )
   // https://en.wikipedia.org/wiki/Gaussian_integral
-  float erfc_3d(vec3 pos, vec3 dir, float tmin, float tmax) {
-    if (abs(tmax - tmin) < 0.001)
-      return gaussian3d(pos)*(tmax - tmin);
-    float b = dot(pos, dir);                    // -INF..INF
+  float erfc_3d(vec3 pos, vec3 dir, float len) {
+    if (len < 0.001)
+      return len*gaussian3d(pos + dir*len*0.5);
+
+    float b = dot(pos, dir);   // -INF..INF
     float h = dot(pos, pos) - b*b;              // 0..INF
-    float s = erfc(b + tmax) - erfc(b + tmin);  // 0..2
+    float s = erfc(b + len) - erfc(b);          // 0..2
     return exp(-h)*s*SQRT_PI*0.5;               // 0..sqrt(PI)
+  }
+
+  // integrate( exp(-(pos + dir*t).y), t=0..len )
+  // https://iquilezles.org/articles/fog
+  float expfog_3d(vec3 pos, vec3 dir, float len) {
+    if (abs(len * dir.y) < 0.001)
+      return exp(-pos.y) * len;
+
+    return exp(-pos.y) * (1.0 - exp(-len * dir.y)) / dir.y;
   }
 `;
 
@@ -215,25 +224,27 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   struct BVHRay { vec3 origin, dir; float dist; } bvhRay;
   float bvhSumLight;
   vec4 bvhSumColor;
-  vec4 bvhFogBounds = vec4(0);
+  mat2x3 bvhFogBounds = mat2x3(0);
 
-  void bvhInitBoundingSphere() {
+  void bvhInitFogBounds() {
     vec3 aa = texelFetch1D( bvh.bvhBounds, 0u ).xyz;
     vec3 bb = texelFetch1D( bvh.bvhBounds, 1u ).xyz;
-    bvhFogBounds.xyz = (aa + bb)*0.5;
-    bvhFogBounds.w = length(bb - aa)*0.5;
+    vec3 mid = (aa + bb)*0.5;
+    vec3 len = (bb - aa)*0.5*vec3(1e3, 1, 1e3);
+    bvhFogBounds = mat2x3(mid - len, mid + len);
   }
 
   void bvhInitSearch() {
     bvhSumLight = 1.0;
     bvhSumColor = vec4(0);
 
-    if (bvhFogBounds.w > 0.) {
-      vec3 pos = bvhRay.origin - bvhFogBounds.xyz;
-      float s = bvhFogBounds.w * SQRT_2 / 2.0;
-      float fog = s*erfc_3d(pos/s, bvhRay.dir, 0., INFINITY);
-      bvhSumLight *= exp(-fog*gsd.fogDensity);
-      bvhSumColor += vec4(1)*gsd.fogDensity*gaussian3d(pos/s);
+    if (bvhFogBounds[0] != bvhFogBounds[1]) {
+      vec3 pos = bvhRay.origin - (bvhFogBounds[0] + bvhFogBounds[1])*0.5;
+      pos.y -= bvhFogBounds[0].y;
+      float scale = 0.2 * (bvhFogBounds[1] - bvhFogBounds[0]).y;
+      float dens = scale * expfog_3d(pos/scale, bvhRay.dir, bvhRay.dist/scale);
+      bvhSumLight *= exp(-dens*gsd.fogDensity);
+      bvhSumColor += vec4(1)*gsd.fogDensity*exp(-pos.y/scale);
     }
   }
 
@@ -279,7 +290,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
         // However rasterizers implicitly scale opacity of splats by their size,
         // and hence the splat.w multiplier is omitted here.
         
-        float fog = erfc_3d(r/scale, bvhRay.dir, 0., bvhRay.dist/scale);
+        float fog = erfc_3d(r/scale, bvhRay.dir, bvhRay.dist/scale);
         fog *= scale*splat.w;
         vec4 color = texelFetch1D(gsd.splatColors, splatId);
         color.w *= gsd.splatOpacity/splat.w;
@@ -521,7 +532,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           rayDir = normalize(rayDir);
 
           if (gsd.fogDensity > 0.001)
-            bvhInitBoundingSphere();
+            bvhInitFogBounds();
 
           // .xy = accumulated Y'UV color + density, packed as 4 x float16
           // .z = current Z depth for raycasting
@@ -532,14 +543,18 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           if (frameId == 0)
             rayData.xy = PACK_4x16(vec4(0));
 
-          if (bvhFogBounds.w > 0.) {
+          if (bvhFogBounds[0] != bvhFogBounds[1]) {
             if (frameId == 0) {
-              vec2 tt = raySphere(rayOrigin - bvhFogBounds.xyz, rayDir, bvhFogBounds.w);
+              vec2 tt = rayBox(rayOrigin, rayDir, bvhFogBounds[0], bvhFogBounds[1]);
               rayData.z = max(tt.x, 0.);
               rayData.w = 0.;
             }
 
-            if (length(rayOrigin + rayDir * abs(rayData.z) - bvhFogBounds.xyz) > bvhFogBounds.w * 1.001)
+            vec3 pos = rayOrigin + rayDir * abs(rayData.z);
+            vec3 pos2 = clamp(pos, bvhFogBounds[0], bvhFogBounds[1]);
+            float margin = length(bvhFogBounds[0] - bvhFogBounds[1])*0.001;
+
+            if (length(pos - pos2) > margin)
               rayData.z = INFINITY;
           }
 
@@ -560,7 +575,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           vec4 color = UNPACK_4x16(rayData.xy);
           color.w *= 8.; // density range: exp(0)..exp(-8) = 1..0.0003
 
-          if (bvhSumColor.w > 0. || bvhFogBounds.w > 0.) {
+          if (bvhSumColor.w > 0. || bvhFogBounds[0] != bvhFogBounds[1]) {
             float luminance = gsd.brightness;
 
             #if USE_SHADOWS
@@ -1069,7 +1084,7 @@ function rebuildGUI() {
       nextSplatPass.material.updateDefines();
       raymarchingPass.material.updateDefines();
     });
-    displayFolder.add(params, 'fogDensity', -3.5, +1.5, 0.5).onChange(() => {
+    displayFolder.add(params, 'fogDensity', -3.5, +3.5, 0.5).onChange(() => {
       nextSplatPass.material.updateDefines();
       raymarchingPass.material.updateDefines();
     });
