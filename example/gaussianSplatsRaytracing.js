@@ -20,6 +20,8 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 
 const params = {
   open: () => selectScene(),
+  //size: () => [28 * 300 / window.devicePixelRatio, 40 * 300 / window.devicePixelRatio],
+  size: () => [window.innerWidth, window.innerHeight],
 
   mode: 'points',
   render: true,
@@ -40,7 +42,10 @@ const params = {
   monochrome: false,
   showCost: false,
   showProgress: false,
+  lightPos: new THREE.Vector3(2, 1, 2).multiplyScalar(1e3),
 };
+
+window.params = params;
 
 const getBVHOptions = () => ({
   strategy: params.strategy,
@@ -49,10 +54,9 @@ const getBVHOptions = () => ({
 });
 
 let renderer, camera, scene, orbit, gui, stats, outputContainer;
-let bvh, bvhMesh, bvhHelper, pointCloud;
+let bvh, bvhHelper, pointCloud;
 let raytracingPass, nextSplatPass, raymarchingPass, outputPass;
 let pixelsRT1, pixelsRT2, splatColorsRT;
-let lightPos = new THREE.Vector3(1, 2, 3).multiplyScalar(1e3);
 let frameId = 0;
 
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
@@ -134,11 +138,14 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
 
   // integrate( exp(-(pos + dir*t).y), t=0..len )
   // https://iquilezles.org/articles/fog
-  float expfog_3d(vec3 pos, vec3 dir, float len) {
-    if (abs(len * dir.y) < 0.001)
-      return exp(-pos.y) * len;
+  float expfog_3d(vec3 pos, vec3 dir, vec3 up, float len) {
+    float d = dot(dir, up);
+    float p = dot(pos, up);
 
-    return exp(-pos.y) * (1.0 - exp(-len * dir.y)) / dir.y;
+    if (abs(len * d) < 0.001)
+      return exp(-p) * len;
+
+    return exp(-p) * (1.0 - exp(-len * d)) / d;
   }
 `;
 
@@ -222,15 +229,18 @@ THREE.ShaderChunk['bvh_sorted_splats'] = /* glsl */`
 // Uses BVH to compute aggregate density and shadow at the current spot.
 THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   struct BVHRay { vec3 origin, dir; float dist; } bvhRay;
+  vec3 bvhFogDir = vec3(0,1,0); // the upwards direction
   float bvhSumLight;
   vec4 bvhSumColor;
   mat2x3 bvhFogBounds = mat2x3(0);
 
   void bvhInitFogBounds() {
+    // (aa, bb) is in sun coords, i.e. vec3(0,0,1) points to the sun
     vec3 aa = texelFetch1D( bvh.bvhBounds, 0u ).xyz;
     vec3 bb = texelFetch1D( bvh.bvhBounds, 1u ).xyz;
     vec3 mid = (aa + bb)*0.5;
-    vec3 len = (bb - aa)*0.5*vec3(1e3, 1, 1e3);
+    vec3 len = (bb - aa)*0.5;
+    len *= 1.5;
     bvhFogBounds = mat2x3(mid - len, mid + len);
   }
 
@@ -239,12 +249,18 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     bvhSumColor = vec4(0);
 
     if (bvhFogBounds[0] != bvhFogBounds[1]) {
-      vec3 pos = bvhRay.origin - (bvhFogBounds[0] + bvhFogBounds[1])*0.5;
-      pos.y -= bvhFogBounds[0].y;
-      float scale = 0.2 * (bvhFogBounds[1] - bvhFogBounds[0]).y;
-      float dens = scale * expfog_3d(pos/scale, bvhRay.dir, bvhRay.dist/scale);
+      vec3 pos = bvhRay.origin + bvhFogDir*1.0;
+      float scale = 0.2; // * (bvhFogBounds[1] - bvhFogBounds[0]).z;
+      float dens = scale * expfog_3d(pos/scale, bvhRay.dir, bvhFogDir, bvhRay.dist/scale);
+      float col = scale * expfog_3d(pos/scale, bvhRay.dir, bvhFogDir, 1e-6)/1e-6;
+
+      //vec2 tt = rayBox(pos, bvhRay.dir, bvhFogBounds[0], bvhFogBounds[1]);
+      //tt = max(tt, vec2(0));
+      //float dens = tt.y - tt.x;
+      //float col = 1.0;
+
       bvhSumLight *= exp(-dens*gsd.fogDensity);
-      bvhSumColor += vec4(1)*gsd.fogDensity*exp(-pos.y/scale);
+      bvhSumColor += vec4(col)*gsd.fogDensity;
     }
   }
 
@@ -486,7 +502,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
         projectionMatrix: { value: new THREE.Matrix4() },
         modelWorldMatrix: { value: new THREE.Matrix4() },
 
-        lightPos: { value: lightPos },
+        lightPos: { value: params.lightPos },
         frameId: { value: 0 },
 
       },
@@ -566,9 +582,11 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           }
 
           bvhRay.origin = rayOrigin + rayDir * abs(rayData.z);
-          bvhRay.dir = lightPos - bvhRay.origin; // (vec4(lightDir, 0) * inverse(cameraWorldMatrix)).xyz;
+          vec4 sunPos = vec4(lightPos, 1) * inverse(modelWorldMatrix);
+          bvhRay.dir = sunPos.xyz - bvhRay.origin;
           bvhRay.dist = max(length(bvhRay.dir), 1e-6);
           bvhRay.dir /= bvhRay.dist;
+          bvhFogDir = normalize((vec4(0, 1, 0, 0) * inverse(modelWorldMatrix)).xyz);
           bvhSearchSplats( bvh );
           rayData.w += float(bvhStats.numLookupsBVH + bvhStats.numLookupsSplats);
 
@@ -860,19 +878,20 @@ async function init() {
   outputContainer = document.getElementById('output');
 
   // renderer setup
+  let [w, h] = params.size();
   renderer = new THREE.WebGLRenderer({ preserveDrawingBuffer: true });
   renderer.setPixelRatio(window.devicePixelRatio);
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setSize(w, h, false);
   renderer.setClearColor(0, 0);
   document.body.appendChild(renderer.domElement);
 
   scene = new THREE.Scene();
 
   let light = new THREE.DirectionalLight(0xFFFFFF);
-  light.position.set(lightPos);
+  light.position.set(params.lightPos);
   scene.add(light);
 
-  camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.001, 50);
+  camera = new THREE.PerspectiveCamera(60, w / h, 0.001, 50);
   camera.position.set(1, 1, 2);
   camera.far = 100;
   camera.updateProjectionMatrix();
@@ -905,17 +924,16 @@ async function init() {
 }
 
 function updateRenderSize() {
-  let w = window.innerWidth, h = window.innerHeight;
+  let [w, h] = params.size();
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 
-  renderer.setSize(w, h);
+  renderer.setSize(w, h, false);
   clearRenderTargets();
 }
 
 function clearRenderTargets() {
-  let w = window.innerWidth;
-  let h = window.innerHeight;
+  let [w, h] = params.size();
   pixelsRT1.setSize(w, h);
   pixelsRT2.setSize(w, h);
   frameId = 0;
@@ -988,11 +1006,31 @@ async function initGeometry(url = sceneFile, filename) {
   const material = new THREE.PointsMaterial({ color: 0xCCCCCC });
   scene.remove(pointCloud);
   pointCloud = new THREE.Points(geometry, material);
-  pointCloud.matrixAutoUpdate = false;
   scene.add(pointCloud);
+
+  let sunMatrix = getSunMatrix4();
+  console.debug('det(sunMatrix) = ' + sunMatrix.determinant());
+  pointCloud.geometry.applyMatrix4(sunMatrix.clone().invert());
+  pointCloud.matrix = sunMatrix;
+  pointCloud.matrixAutoUpdate = false;
+  pointCloud.updateMatrixWorld();
 
   updateBVHMesh();
   updateSplatColors(pointCloud.geometry);
+}
+
+function getSunMatrix4() {
+  let c = params.lightPos.clone().normalize();
+  let b = Math.abs(c.x) > Math.abs(c.z) ?
+    new THREE.Vector3(-c.y, c.x, 0).normalize() :
+    new THREE.Vector3(0, -c.z, c.y).normalize();
+  let a = c.clone().cross(b);
+
+  return new THREE.Matrix4(
+    a.x, a.y, a.z, 0,
+    b.x, b.y, b.z, 0,
+    c.x, c.y, c.z, 0,
+    0, 0, 0, 1);
 }
 
 function updateBVHMesh() {
@@ -1003,8 +1041,10 @@ function updateBVHMesh() {
   const position = attributes.position.clone();
   const count = position.count;
 
-  for (let i = 0; i < count; i++)
-    if (i % (1 << params.sparsity) == 0)
+  if (count > 1e5) console.time('updateBVH');
+
+  for (let i = 0, m = 1 << params.sparsity; i < count; i++)
+    if (i % m == 0)
       index.push(i, i, i);
 
   outputContainer.textContent = (index.length / 3) + ' splats';
@@ -1025,15 +1065,41 @@ function updateBVHMesh() {
   bvhGeometry.setAttribute('scale', scaleAttr); // this is for computeTriangleBounds
   bvhGeometry.computeBoundsTree(getBVHOptions());
 
+  // BVH must be aligned with sunrays for best performance
+  let bvhHelperMesh = new THREE.Mesh(bvhGeometry, new THREE.MeshBasicMaterial());
+  bvhHelperMesh.matrix = pointCloud.matrix.clone();
+  bvhHelperMesh.matrixAutoUpdate = false;
+
   scene.remove(bvhHelper);
-  bvhMesh = new THREE.Mesh(bvhGeometry, new THREE.MeshBasicMaterial());
-  bvhHelper = new MeshBVHHelper(bvhMesh, params.depth);
+  bvhHelper = new MeshBVHHelper(bvhHelperMesh, params.depth);
+  scene.add(bvhHelper);
   bvhHelper.displayParents = true;
   bvhHelper.opacity = 0.1;
   bvhHelper.update();
-  scene.add(bvhHelper);
 
-  updateBVH();
+  bvh = new MeshBVH(bvhGeometry, getBVHOptions()); // creates the octree
+
+  // (position.xyz, scale.x) -> position.xyzw
+  let position4 = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
+
+  for (let i = 0; i < count; i++) {
+    position4.array[i * 4 + 3] = scaleAttr.array[i * scaleAttr.itemSize];
+    for (let j = 0; j < 3; j++)
+      position4.array[i * 4 + j] = position.array[i * position.itemSize + j];
+  }
+
+  // It would be better if MeshBVH supported
+  // the 'position' attribute with 4 elements (xyzw).
+  position.copy(position4);
+
+  let bbox = new THREE.Box3();
+  bvh.getBoundingBox(bbox);
+  let dx = bbox.max.x - bbox.min.x;
+  let dy = bbox.max.y - bbox.min.y;
+  let dz = bbox.max.z - bbox.min.z;
+  //console.debug('Bounding box:', dx.toFixed(1), 'x', dy.toFixed(1), 'x', dz.toFixed(1));
+
+  if (count > 1e5) console.timeEnd('updateBVH');
 }
 
 function rebuildGUI() {
@@ -1061,9 +1127,8 @@ function rebuildGUI() {
     updateBVHMesh();
   });
   pointsFolder.add(params, 'invertY').onChange(v => {
-    pointCloud.matrix.elements[5] = params.invertY ? -1 : 1;
-    bvhMesh.matrix.copy(pointCloud.matrix);
-    bvhMesh.updateMatrixWorld();
+    pointCloud.matrix.scale(new THREE.Vector3(1, 1, -1));
+    bvhHelper.mesh.matrix = pointCloud.matrix.clone();
     clearRenderTargets();
   });
   pointsFolder.open();
@@ -1108,37 +1173,6 @@ function rebuildGUI() {
     displayFolder.add(params, 'showProgress');
     displayFolder.add(params, 'showCost');
   }
-}
-
-function updateBVH() {
-  console.time('updateBVH');
-  let geometry = bvhMesh.geometry;
-  bvh = new MeshBVH(geometry, getBVHOptions());
-
-  // (position.xyz, scale.x) -> position.xyzw
-  let { position, scale } = geometry.attributes;
-
-  let count = position.count;
-  let position4 = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
-
-  for (let i = 0; i < count; i++) {
-    position4.array[i * 4 + 3] = scale.array[i * scale.itemSize];
-    for (let j = 0; j < 3; j++)
-      position4.array[i * 4 + j] = position.array[i * position.itemSize + j];
-  }
-
-  // It would be better if MeshBVH supported
-  // the 'position' attribute with 4 elements (xyzw).
-  position.copy(position4);
-
-  let bbox = new THREE.Box3();
-  bvh.getBoundingBox(bbox);
-  let dx = bbox.max.x - bbox.min.x;
-  let dy = bbox.max.y - bbox.min.y;
-  let dz = bbox.max.z - bbox.min.z;
-  console.log('Bounding box:', dx.toFixed(1), 'x', dy.toFixed(1), 'x', dz.toFixed(1));
-
-  console.timeEnd('updateBVH');
 }
 
 function updateSplatColors(geometry) {
