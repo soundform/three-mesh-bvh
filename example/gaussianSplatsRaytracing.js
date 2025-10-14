@@ -181,6 +181,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   vec3 gSunDir = vec3(0);
   float gSunDist = 0.;
   vec4 gFogSplat = vec4(0);
+  vec4 gFogColor = vec4(0);
   mat2x3 bvhBounds = mat2x3(0); // min..max or AABB
   float bvhSumLight = 0.;
   vec4 bvhSumColor = vec4(0);
@@ -201,8 +202,8 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
       color.rgb *= color.rgb;
     #endif
     
-    color.rgb *= color.w;
     color.w *= gsd.splatOpacity;
+    color.rgb *= color.w;
 
     // The proper integral would be:
     //
@@ -216,8 +217,10 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     return weight*color;
   }
 
+  // Fast fog integration over a ray not occluded by shadows.
   vec4 integrateFog(vec3 pos, vec3 dir, float len) {
     return vec4(0);
+
     vec4 sum = vec4(0);
 
     for (int i = 0; i < 64; i++) {
@@ -231,12 +234,12 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
       float lum = gsd.brightness;
 
       #if USE_SHADOWS
-        float weight = integrateSplat(gFogSplat, vec4(1), p, sunDir, sunDist).w;
+        float weight = integrateSplat(gFogSplat, gFogColor, p, sunDir, sunDist).w;
         lum *= exp(-weight);
         lum += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
       #endif
 
-      vec4 vol = integrateSplat(gFogSplat, vec4(1), p, dir, dt);
+      vec4 vol = integrateSplat(gFogSplat, gFogColor, p, dir, dt);
       vol.rgb *= lum;
       
       sum.rgb += exp(-sum.w) * vol.rgb;
@@ -251,9 +254,9 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     bvhSumColor = vec4(0);
 
     if (gFogSplat.w > 0.) {
-      float weight = integrateSplat(gFogSplat, vec4(1), gRayPos, gSunDir, gSunDist).w;
+      float weight = integrateSplat(gFogSplat, gFogColor, gRayPos, gSunDir, gSunDist).w;
       bvhSumLight = exp(-weight);
-      bvhSumColor = integrateSplat(gFogSplat, vec4(1), gRayPos, gRayDir, RAY_STEP);
+      bvhSumColor = integrateSplat(gFogSplat, gFogColor, gRayPos, gRayDir, RAY_STEP);
     }
   }
 
@@ -511,7 +514,6 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
           float maxFogDist = length(aa - bb);
           aa.z -= maxFogDist; // the shadow that the AABB box casts
-          bb.z += maxFogDist;
 
           // rayOrigin doesn't change, but rayData.z does
           vec2 tt = rayBox(rayOrigin, rayDir, aa, bb);
@@ -612,7 +614,8 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
           if (hasFog) {
             // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
-            gFogSplat = vec4(0, 0, 0, gsd.fogDensity/gsd.splatOpacity);
+            gFogSplat = vec4(0, 0, 0, gsd.fogDensity);
+            gFogColor = vec4(1, 1, 1, 1./gsd.splatOpacity);
           }
 
           bvhInitBounds();
