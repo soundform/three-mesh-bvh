@@ -42,7 +42,7 @@ const params = {
   monochrome: false,
   showCost: false,
   showProgress: false,
-  lightPos: new THREE.Vector3(2, 1, 2).multiplyScalar(1e3),
+  lightPos: new THREE.Vector3(100, 100, 100),
 };
 
 window.params = params;
@@ -116,23 +116,24 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
     return exp(-dot(r, r));
   }
   
-  // integrate( exp(-x*x))*2/sqrt(PI), 0..x )
+  // integrate( exp(-x*x))*2/sqrt(PI), 0..x ) = -1..1
   // https://en.wikipedia.org/wiki/Error_function
-  float erfc(float x) {
-    if (x < -3.5) return -1.;
-    if (x > +3.5) return +1.;
-    return sign(x)*sqrt(1. - exp2(-SQRT_PI*x*x)); // -1..1
+  float erf(float x) {
+    if (abs(x) > 3.5)
+        return sign(x);
+
+    return sign(x)*sqrt(1. - exp2(-SQRT_PI*x*x));
   }
 
   // 2/sqrt(PI) * integrate( exp(-|pos + dir*t|^2), t=0..len )
   // https://en.wikipedia.org/wiki/Gaussian_integral
-  float erfc_3d(vec3 pos, vec3 dir, float len) {
+  float erf3d(vec3 pos, vec3 dir, float len) {
     if (len < 0.001)
-      return len*gaussian3d(pos + dir*len*0.5);
+      return len*gaussian3d(pos);
 
     float b = dot(pos, dir);   // -INF..INF
     float h = dot(pos, pos) - b*b;              // 0..INF
-    float s = erfc(b + len) - erfc(b);          // 0..2
+    float s = erf(b + len) - erf(b);          // 0..2
     return exp(-h)*s*SQRT_PI*0.5;               // 0..sqrt(PI)
   }
 
@@ -151,17 +152,17 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
 
 THREE.ShaderChunk['ray_utils'] = /* glsl */`
   vec2 rayBox(vec3 ro, vec3 rd, vec3 aa, vec3 bb) {
-      vec3 ird = 1./rd;
-      vec3 tbot = ird*(aa - ro);
-      vec3 ttop = ird*(bb - ro);
-      vec3 tmin = min(ttop, tbot);
-      vec3 tmax = max(ttop, tbot);
-      vec2 tx = max(tmin.xx, tmin.yz);
-      vec2 ty = min(tmax.xx, tmax.yz);
-      vec2 tt;
-      tt.x = max(tx.x, tx.y);
-      tt.y = min(ty.x, ty.y);
-      return tt;
+    vec3 ird = 1./rd;
+    vec3 tbot = ird*(aa - ro);
+    vec3 ttop = ird*(bb - ro);
+    vec3 tmin = min(ttop, tbot);
+    vec3 tmax = max(ttop, tbot);
+    vec2 tx = max(tmin.xx, tmin.yz);
+    vec2 ty = min(tmax.xx, tmax.yz);
+    vec2 tt;
+    tt.x = max(tx.x, tx.y);
+    tt.y = min(ty.x, ty.y);
+    return tt;
   }
 
   vec2 raySphere(vec3 ro, vec3 rd, float r) {
@@ -171,96 +172,88 @@ THREE.ShaderChunk['ray_utils'] = /* glsl */`
   }
 `;
 
-// Uses BVH to find the nearest N splats along the ray. 
-THREE.ShaderChunk['bvh_sorted_splats'] = /* glsl */`
-  #ifndef MAX_SPLATS_PER_RAY
-  #define MAX_SPLATS_PER_RAY 1
-  #endif
-
-  struct BVHRay { vec3 origin, dir; } bvhRay;
-
-  // The nearest N splats are sorted by distance.
-  // It's possible to use a min-heap instead, but:
-  //  1) GPUs don't like the min-heap read/write patterns.
-  //  2) The splats need to be sorted anyway for color blending.
-  float[MAX_SPLATS_PER_RAY] gSplatDists;
-  uint[MAX_SPLATS_PER_RAY] gSplatIds;
-  int gNumSplats; // 0..MAX_SPLATS_PER_RAY
-
-  void bvhInitSearch() {
-    for (int i = 0; i < MAX_SPLATS_PER_RAY; i++)
-      gSplatDists[i] = INFINITY;
-    gNumSplats = 0;
-  }
-
-  bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
-    vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
-    return tt.x < tt.y && tt.x < gSplatDists[MAX_SPLATS_PER_RAY-1];
-  }
-
-  bool bvhVisitSplat(uint splatId) {
-    vec4 splat = texelFetch1D( bvh.position, splatId );
-    vec2 tt = raySphere(bvhRay.origin - splat.xyz, bvhRay.dir, splat.w);
-    float d = (tt.x + tt.y)*0.5;
-    
-    if (tt.x >= tt.y || d <= 0. || d >= gSplatDists[MAX_SPLATS_PER_RAY-1])
-      return false;
-
-    // insert the new sample point into the sorted list
-    gNumSplats = min(gNumSplats + 1, MAX_SPLATS_PER_RAY);
-
-    for (int k = gNumSplats - 1; k >= 0; k--) {
-      if (d >= gSplatDists[k])
-        break;
-
-      if (k + 1 < MAX_SPLATS_PER_RAY) {
-        gSplatDists[k + 1] = gSplatDists[k];
-        gSplatIds[k + 1] = gSplatIds[k];
-      }
-
-      gSplatDists[k] = d;
-      gSplatIds[k] = splatId;
-    }
-
-    return true;
-  }
-`;
-
 // Uses BVH to compute aggregate density and shadow at the current spot.
 THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   struct BVHRay { vec3 origin, dir; float dist; } bvhRay;
-  vec3 bvhFogDir = vec3(0,1,0); // the upwards direction
-  float bvhSumLight;
-  vec4 bvhSumColor;
-  mat2x3 bvhFogBounds = mat2x3(0);
+  vec3 gRayPos = vec3(0);
+  vec3 gRayDir = vec3(0);
+  vec3 gSunPos = vec3(0);
+  vec3 gSunDir = vec3(0);
+  float gSunDist = 0.;
+  vec4 gFogSplat = vec4(0);
+  mat2x3 bvhBounds = mat2x3(0); // min..max or AABB
+  float bvhSumLight = 0.;
+  vec4 bvhSumColor = vec4(0);
 
-  void bvhInitFogBounds() {
-    // (aa, bb) is in sun coords, i.e. vec3(0,0,1) points to the sun
+  void bvhInitBounds() {
     vec3 aa = texelFetch1D( bvh.bvhBounds, 0u ).xyz;
     vec3 bb = texelFetch1D( bvh.bvhBounds, 1u ).xyz;
     vec3 mid = (aa + bb)*0.5;
     vec3 len = (bb - aa)*0.5;
-    len *= 1.5;
-    bvhFogBounds = mat2x3(mid - len, mid + len);
+    bvhBounds = mat2x3(mid - len, mid + len);
+  }
+
+  vec4 integrateSplat(vec4 splat, vec4 color, vec3 pos, vec3 dir, float len) {
+    if (gsd.monochrome)
+      color.rgb = vec3(1)*vmid3(color.rgb);
+
+    #if USE_GAMMA
+      color.rgb *= color.rgb;
+    #endif
+    
+    color.rgb *= color.w;
+    color.w *= gsd.splatOpacity;
+
+    // The proper integral would be:
+    //
+    //    erf3d((origin - splat.xyz)/splat.w/scale, dir)*splat.w*scale
+    //
+    // However rasterizers implicitly multiply opacity of splats
+    // by their size, so the splat.w multiplier is omitted here.
+    vec3 r = (pos - splat.xyz) / splat.w;
+    float scale = SQRT_2 / gsd.maxStdDev;
+    float weight = scale*erf3d(r/scale, dir, len/scale); // len*gaussian3d(r/scale)
+    return weight*color;
+  }
+
+  vec4 integrateFog(vec3 pos, vec3 dir, float len) {
+    return vec4(0);
+    vec4 sum = vec4(0);
+
+    for (int i = 0; i < 64; i++) {
+      float dt = len / 64.;
+      float t = float(i)*dt;
+      vec3 p = pos + dir*t;
+      vec3 sunDir = gSunPos - p;
+      float sunDist = length(sunDir);
+      sunDir /= sunDist;
+
+      float lum = gsd.brightness;
+
+      #if USE_SHADOWS
+        float weight = integrateSplat(gFogSplat, vec4(1), p, sunDir, sunDist).w;
+        lum *= exp(-weight);
+        lum += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
+      #endif
+
+      vec4 vol = integrateSplat(gFogSplat, vec4(1), p, dir, dt);
+      vol.rgb *= lum;
+      
+      sum.rgb += exp(-sum.w) * vol.rgb;
+      sum.w += vol.w;
+    }
+
+    return sum;
   }
 
   void bvhInitSearch() {
     bvhSumLight = 1.0;
     bvhSumColor = vec4(0);
 
-    if (bvhFogBounds[0] != bvhFogBounds[1]) {
-      vec3 pos = bvhRay.origin + bvhFogDir*1.0;
-      float scale = 0.2; // * (bvhFogBounds[1] - bvhFogBounds[0]).z;
-      float dens = scale * expfog_3d(pos/scale, bvhRay.dir, bvhFogDir, bvhRay.dist/scale);
-      float col = scale * expfog_3d(pos/scale, bvhRay.dir, bvhFogDir, 1e-6)/1e-6;
-
-      //vec2 tt = rayBox(pos, bvhRay.dir, bvhFogBounds[0], bvhFogBounds[1]);
-      //tt = max(tt, vec2(0));
-      //float dens = tt.y - tt.x;
-      //float col = 1.0;
-
-      bvhSumLight *= exp(-dens*gsd.fogDensity);
-      bvhSumColor += vec4(col)*gsd.fogDensity;
+    if (gFogSplat.w > 0.) {
+      float weight = integrateSplat(gFogSplat, vec4(1), gRayPos, gSunDir, gSunDist).w;
+      bvhSumLight = exp(-weight);
+      bvhSumColor = integrateSplat(gFogSplat, vec4(1), gRayPos, gRayDir, RAY_STEP);
     }
   }
 
@@ -270,14 +263,14 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     
     #if USE_SHADOWS
     
-      vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
+      vec2 tt = rayBox( gRayPos, gSunDir, boundsMin, boundsMax );
       tt.x = max(tt.x, 0.);
-      tt.y = min(tt.y, bvhRay.dist);
+      tt.y = min(tt.y, gSunDist);
       return tt.x < tt.y;
 
     #else 
 
-      return bvhRay.origin == clamp( bvhRay.origin, boundsMin, boundsMax );
+      return gRayPos == clamp( gRayPos, boundsMin, boundsMax );
 
     #endif
   }
@@ -291,84 +284,30 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     vec3 r = (bvhRay.origin - splat.xyz) / splat.w;
     float rd = dot(r, bvhRay.dir);
     float r2 = dot(r, r);
-    float h2 = r2 - rd*rd;
-    float scale = SQRT_2 / gsd.maxStdDev;
+    float h2 = r2 - rd*rd; // h2 < r2
+    vec4 color = vec4(0);
 
-    // see if bvhRay intersects the splat
-    if (h2 < 1.) {
+    if (bool(USE_SHADOWS) || r2 < 1.)
+      color = texelFetch1D(gsd.splatColors, splatId);
 
-      #if USE_SHADOWS
-      
-        // The proper integral would be:
-        //
-        //    erfc_3d((origin - splat.xyz)/splat.w/scale, dir)*splat.w*scale
-        //
-        // However rasterizers implicitly scale opacity of splats by their size,
-        // and hence the splat.w multiplier is omitted here.
-        
-        float fog = erfc_3d(r/scale, bvhRay.dir, bvhRay.dist/scale);
-        fog *= scale*splat.w;
-        vec4 color = texelFetch1D(gsd.splatColors, splatId);
-        color.w *= gsd.splatOpacity/splat.w;
-        bvhSumLight *= exp(-fog * color.w);
+    // see if the sunray intersects the splat
+    if (bool(USE_SHADOWS) && h2 < 1.) {
+      float weight = integrateSplat(splat, color, gRayPos, gSunDir, gSunDist).w;
+      bvhSumLight *= exp(-weight);
+    }
 
-      #endif
-
-      // see if bvhRay.origin is inside the splat
-      if (r2 < 1.) {
-        
-        // Rasterizers render small splats with the same opacity as large splats,
-        // but if the splats were to be integrated properly, the opacity would have
-        // to be scaled by the splat size: integrate(exp(-1/2 * |r/s|^2)) = sqrt(2*PI)*s
-        // This means that rasterizers implicitly scale the density of splats and this
-        // has to be accounted for here.
-        
-        float density = gaussian3d(r/scale);
-        vec4 color = texelFetch1D(gsd.splatColors, splatId);
-        color.w *= gsd.splatOpacity/splat.w;
-
-        if (gsd.monochrome)
-          color.rgb = vec3(1)*vmid3(color.rgb);
-        
-        #if USE_GAMMA
-          color.rgb *= color.rgb;
-        #endif
-
-        color.rgb *= color.w;
-        bvhSumColor += color * density;
-      }
+    // see if the current pos is inside the splat
+    if (r2 < 1.) {
+      // Rasterizers render small splats with the same opacity as large splats,
+      // but if the splats were to be integrated properly, the opacity would have
+      // to be scaled by the splat size: integrate(exp(-1/2 * |r/s|^2)) = sqrt(2*PI)*s
+      // This means that rasterizers implicitly scale the density of splats and this
+      // must to be accounted for here.
+      vec4 dens = integrateSplat(splat, color, gRayPos, gRayDir, RAY_STEP);
+      bvhSumColor += dens/splat.w;
     }
 
     return h2 < 1.;
-  }
-`;
-
-// Uses BVH to find the next nearest splat along the ray.
-THREE.ShaderChunk['bvh_nearest_splat'] = /* glsl */`
-  struct BVHRay { vec3 origin, dir; } bvhRay;
-  struct BVHNearest { float dist; uint splatId; } bvhNearest;
-
-  void bvhInitSearch() {
-    bvhNearest = BVHNearest(INFINITY, 0u);
-  }
-
-  bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
-    vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
-    return tt.x < tt.y && tt.x < bvhNearest.dist && tt.y > 0.;
-  }
-
-  bool bvhVisitSplat(uint splatId) {
-    vec4 splat = texelFetch1D( bvh.position, splatId );
-    vec2 tt = raySphere(bvhRay.origin - splat.xyz, bvhRay.dir, splat.w);
-    tt = max(tt, vec2(0));
-
-    if (tt.x < tt.y && tt.x < bvhNearest.dist && tt.y > 0.) {
-      bvhNearest.dist = tt.x;
-      bvhNearest.splatId = splatId;
-      return true;
-    }
-    
-    return false;
   }
 `;
 
@@ -432,7 +371,34 @@ class NextSplatMaterial extends THREE.ShaderMaterial {
 
         #include <ray_utils>
         #include <gaussian_utils>
-        #include <bvh_nearest_splat>
+
+        struct BVHRay { vec3 origin, dir; } bvhRay;
+        struct BVHNearest { float dist; uint splatId; } bvhNearest;
+
+        void bvhInitSearch() {
+          bvhNearest = BVHNearest(INFINITY, 0u);
+        }
+
+        bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
+          vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
+          return tt.x < tt.y && tt.x < bvhNearest.dist && tt.y > 0.;
+        }
+
+        // Finds the nearest splat along the ray.
+        bool bvhVisitSplat(uint splatId) {
+          vec4 splat = texelFetch1D( bvh.position, splatId );
+          vec2 tt = raySphere(bvhRay.origin - splat.xyz, bvhRay.dir, splat.w);
+          tt = max(tt, vec2(0));
+
+          if (tt.x < tt.y && tt.x < bvhNearest.dist && tt.y > 0.) {
+            bvhNearest.dist = tt.x;
+            bvhNearest.splatId = splatId;
+            return true;
+          }
+          
+          return false;
+        }
+
         ${BVHShaderGLSL.bvh_gsplat_ray_functions}
         #include <common>
         #include <unpack_4x16>
@@ -539,6 +505,81 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
         #include <common>
         #include <unpack_4x16>
 
+        bool skipFog(vec3 rayOrigin, vec3 rayDir, inout vec4 rayData, inout vec4 color) {
+          vec3 aa = bvhBounds[0];
+          vec3 bb = bvhBounds[1];
+
+          float maxFogDist = length(aa - bb);
+          aa.z -= maxFogDist; // the shadow that the AABB box casts
+          bb.z += maxFogDist;
+
+          // rayOrigin doesn't change, but rayData.z does
+          vec2 tt = rayBox(rayOrigin, rayDir, aa, bb);
+          tt.x = max(tt.x, 0.);
+          
+          if (tt.x >= tt.y)
+            tt = vec2(INFINITY);
+
+          if (frameId == 0) {
+            rayData.z = tt.x + RAY_STEP*0.5;
+            
+            if (rayData.z > RAY_STEP) {
+              // add fog that's in front of the AABB
+              float len = min(rayData.z, maxFogDist);
+              vec3 pos = rayOrigin;
+              if (rayData.z < INFINITY)
+                pos += rayDir*(rayData.z - len);
+              vec4 fog = integrateFog(pos, rayDir, len);
+              color.rgb += exp(-color.w) * fog.rgb;
+              color.w += fog.w;
+              return true;
+            }
+          } else if (rayData.z > tt.y) {
+            // add fog that's behind the AABB
+            vec4 fog = integrateFog(rayOrigin + rayData.z*rayDir, rayDir, maxFogDist);
+            color.rgb += exp(-color.w) * fog.rgb;
+            color.w += fog.w;
+            rayData.z = INFINITY;
+            return true;
+          }
+
+          return false;
+        }
+
+        bool blendSplats(vec3 rayOrigin, vec3 rayDir, inout vec4 rayData, inout vec4 color) {
+          bvhSearchSplats( bvh );
+          rayData.w += float(bvhStats.numLookupsBVH + bvhStats.numLookupsSplats);
+
+          if (bvhSumColor.w <= 0. && gFogSplat.w == 0.)
+            return false;
+
+          float luminance = gsd.brightness;
+
+          #if USE_SHADOWS
+            luminance *= bvhSumLight;
+            luminance += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
+          #endif
+
+          vec4 vol = bvhSumColor;
+          vol.rgb *= luminance;
+          
+          color.rgb += exp(-color.w) * vol.rgb;
+          color.w += vol.w;
+
+          rayData.z += RAY_STEP;
+          return true;
+        }
+
+        vec4 compress(vec4 rayData, vec4 color) {
+          color.w /= 8.;
+          if (color.w >= 0.999)
+              rayData.z = INFINITY;
+          if (rayData.z >= INFINITY)
+            color.w = 1.0;
+          rayData.xy = PACK_4x16(color);
+          return rayData;
+        }
+
         void main() {
           vec2 ndc = vUv*2. - 1.;
           vec3 rayOrigin, rayDir;
@@ -547,78 +588,60 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
             rayOrigin, rayDir);
           rayDir = normalize(rayDir);
 
-          if (gsd.fogDensity > 0.001)
-            bvhInitFogBounds();
-
-          // .xy = accumulated Y'UV color + density, packed as 4 x float16
+          // .xy = accumulated color + density, packed as 4 x float16
           // .z = current Z depth for raycasting
           // .w = accumulated cost
           vec2 size = vec2(textureSize(pixelData, 0));
           vec4 rayData = texelFetch(pixelData, ivec2(vUv*size), 0);
+          bool hasFog = gsd.fogDensity > 1./1024.;
 
-          if (frameId == 0)
+          if (frameId == 0) {
             rayData.xy = PACK_4x16(vec4(0));
-
-          if (bvhFogBounds[0] != bvhFogBounds[1]) {
-            if (frameId == 0) {
-              vec2 tt = rayBox(rayOrigin, rayDir, bvhFogBounds[0], bvhFogBounds[1]);
-              rayData.z = max(tt.x, 0.);
-              rayData.w = 0.;
-            }
-
-            vec3 pos = rayOrigin + rayDir * abs(rayData.z);
-            vec3 pos2 = clamp(pos, bvhFogBounds[0], bvhFogBounds[1]);
-            float margin = length(bvhFogBounds[0] - bvhFogBounds[1])*0.001;
-
-            if (length(pos - pos2) > margin)
-              rayData.z = INFINITY;
+            // NextSplatMaterial runs first when fog=0
+            if (hasFog) rayData.zw = vec2(0);
           }
 
-          // z < 0      the current point is empty, NextSplatMaterial will find the next splat
-          // z > INF    all splats have been blended
-          if (rayData.z < 0. || rayData.z >= INFINITY) {
+          if (rayData.z < 0.)
+            discard; // it's NextSplatMaterial's turn
+
+          // skip already rendered pixels
+          if (rayData.z >= INFINITY) {
             gl_FragColor = rayData;
             return;
           }
 
-          bvhRay.origin = rayOrigin + rayDir * abs(rayData.z);
-          vec4 sunPos = vec4(lightPos, 1) * inverse(modelWorldMatrix);
-          bvhRay.dir = sunPos.xyz - bvhRay.origin;
-          bvhRay.dist = max(length(bvhRay.dir), 1e-6);
-          bvhRay.dir /= bvhRay.dist;
-          bvhFogDir = normalize((vec4(0, 1, 0, 0) * inverse(modelWorldMatrix)).xyz);
-          bvhSearchSplats( bvh );
-          rayData.w += float(bvhStats.numLookupsBVH + bvhStats.numLookupsSplats);
+          if (hasFog) {
+            // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
+            gFogSplat = vec4(0, 0, 0, gsd.fogDensity/gsd.splatOpacity);
+          }
+
+          bvhInitBounds();
+
+          gRayDir = rayDir;
+          gSunPos = (vec4(lightPos, 1) * inverse(modelWorldMatrix)).xyz;
+          gRayPos = rayOrigin + rayDir * rayData.z;
+          gSunDir = gSunPos - gRayPos;
+          gSunDist = length(gSunDir);
+          gSunDir /= gSunDist;
+
+          bvhRay.origin = gRayPos;
+          bvhRay.dir = gSunDir;
+          bvhRay.dist = gSunDist;
 
           vec4 color = UNPACK_4x16(rayData.xy);
           color.w *= 8.; // density range: exp(0)..exp(-8) = 1..0.0003
 
-          if (bvhSumColor.w > 0. || bvhFogBounds[0] != bvhFogBounds[1]) {
-            float luminance = gsd.brightness;
-
-            #if USE_SHADOWS
-              luminance *= bvhSumLight;
-              luminance += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
-            #endif
-
-            vec4 vol = bvhSumColor * RAY_STEP;
-            vol.rgb *= luminance;
-            
-            color.rgb += exp(-color.w) * vol.rgb;
-            color.w += vol.w;
-
-            rayData.z += RAY_STEP;
-          } else {
-            rayData.z *= -1.; // let NextSplatMaterial find the next splat
+          if (hasFog) {
+            if (skipFog(rayOrigin, rayDir, rayData, color)) {
+              gl_FragColor = compress(rayData, color);
+              return;
+            }
           }
-          
-          color.w /= 8.;
-          
-          if (color.w > 0.999)
-              rayData.z = INFINITY;
 
-          gl_FragColor.xy = PACK_4x16(color);
-          gl_FragColor.zw = rayData.zw;
+          if (!blendSplats(rayOrigin, rayDir, rayData, color))
+            rayData.z *= -1.; // let NextSplatMaterial find the next splat
+          
+          gl_FragColor = compress(rayData, color);
         }`
     });
   }
@@ -626,7 +649,6 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
 // Finds the nearest 8 splats, blends them, then repeats the same at the next frame.
 // In practice, it's better to use a proper rasterizer: https://sparkjs.dev.
-// It's only needed to verify the output of raymarching.
 class RaytracingMaterial extends THREE.ShaderMaterial {
 
   updateDefines() {
@@ -679,7 +701,54 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
         uniform BVH bvh;
         uniform GSplatsData gsd;
 
-        #include <bvh_sorted_splats>
+        struct BVHRay { vec3 origin, dir; } bvhRay;
+
+        // The nearest N splats are sorted by distance.
+        // It's possible to use a min-heap instead, but:
+        //  1) GPUs don't like the min-heap read/write patterns.
+        //  2) The splats need to be sorted anyway for color blending.
+        float[MAX_SPLATS_PER_RAY] gSplatDists;
+        uint[MAX_SPLATS_PER_RAY] gSplatIds;
+        int gNumSplats; // 0..MAX_SPLATS_PER_RAY
+
+        void bvhInitSearch() {
+          for (int i = 0; i < MAX_SPLATS_PER_RAY; i++)
+            gSplatDists[i] = INFINITY;
+          gNumSplats = 0;
+        }
+
+        bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
+          vec2 tt = rayBox( bvhRay.origin, bvhRay.dir, boundsMin, boundsMax );
+          return tt.x < tt.y && tt.x < gSplatDists[MAX_SPLATS_PER_RAY-1];
+        }
+
+        // Use BVH to find the nearest N splats along the ray. 
+        bool bvhVisitSplat(uint splatId) {
+          vec4 splat = texelFetch1D( bvh.position, splatId );
+          vec2 tt = raySphere(bvhRay.origin - splat.xyz, bvhRay.dir, splat.w);
+          float d = (tt.x + tt.y)*0.5;
+          
+          if (tt.x >= tt.y || d <= 0. || d >= gSplatDists[MAX_SPLATS_PER_RAY-1])
+            return false;
+
+          // insert the new sample point into the sorted list
+          gNumSplats = min(gNumSplats + 1, MAX_SPLATS_PER_RAY);
+
+          for (int k = gNumSplats - 1; k >= 0; k--) {
+            if (d >= gSplatDists[k])
+              break;
+
+            if (k + 1 < MAX_SPLATS_PER_RAY) {
+              gSplatDists[k + 1] = gSplatDists[k];
+              gSplatIds[k + 1] = gSplatIds[k];
+            }
+
+            gSplatDists[k] = d;
+            gSplatIds[k] = splatId;
+          }
+
+          return true;
+        }
         
         ${BVHShaderGLSL.bvh_gsplat_ray_functions}
 
@@ -751,7 +820,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
 
           vec2 size = vec2(textureSize(pixelData, 0));
 
-          // .xy = accumulated Y'UV color + density, packed as 4 x float16
+          // .xy = accumulated color + density, packed as 4 x float16
           // .z = current Z depth for raycasting
           // .w = accumulated cost
           vec4 rayData = texelFetch(pixelData, ivec2(vUv*size), 0);
@@ -1242,8 +1311,9 @@ function render() {
     }
 
     if (params.mode == 'raymarching') {
-      if (params.fogDensity < -3) {
+      let hasFog = 10 ** params.fogDensity > 1 / 1024;
 
+      if (!hasFog) {
         uniforms = nextSplatPass.material.uniforms;
         uniforms.bvh.value.updateFrom(bvh);
         uniforms.gsd.value = new GSplatsDataUniformStruct();
