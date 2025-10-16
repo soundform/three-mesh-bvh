@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { CopyShader } from 'three/examples/jsm/shaders/CopyShader.js';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
@@ -26,7 +27,7 @@ const params = {
   mode: 'points',
   render: true,
   strategy: SAH,
-  maxDepth: 32,
+  maxDepth: 40,
   maxLeafTris: 8,
   sparsity: 0,
   invertY: false,
@@ -37,15 +38,12 @@ const params = {
   ambientLight: -6, // exp2
   maxSplatsPerRay: 8,
   rayStep: -2.0, // exp10
-  fogDensity: -3.5, // exp10
+  fogDensity: -10, // exp2
   shadows: false,
   monochrome: false,
-  showCost: false,
-  showProgress: false,
-  lightPos: new THREE.Vector3(100, 100, 100),
+  lightPos: new THREE.Vector3(1e3, 2e3, 3e3),
+  shadowMapLayers: 1,
 };
-
-window.params = params;
 
 const getBVHOptions = () => ({
   strategy: params.strategy,
@@ -57,15 +55,14 @@ let renderer, camera, scene, orbit, gui, stats, outputContainer;
 let bvh, bvhHelper, pointCloud;
 let raytracingPass, nextSplatPass, raymarchingPass, shadowMapPass, outputPass;
 let pixelsRT1, pixelsRT2, splatColorsRT;
-let shadowMapRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType, format: THREE.RedFormat });;
-let dummyRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType });
+let shadowMapRT = new THREE.WebGLArrayRenderTarget(1, 1, 1, { type: THREE.UnsignedShortType, format: THREE.RedFormat });
 let frameId = 0;
 
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
+//const sceneFile = 'models/sportcar.ply';
 //const sceneFile = 'models/bunny.glb';
 const sceneFile = 'models/soundform.ply';
-//const sceneFile = 'models/sportcar.ply';
 
 class GSplatsDataUniformStruct {
   splatsCount = pointCloud.geometry.attributes.position.count;
@@ -73,7 +70,7 @@ class GSplatsDataUniformStruct {
   splatOpacity = 2 ** params.splatOpacity;
   brightness = 2 ** params.brightness;
   ambientLight = 2 ** params.ambientLight;
-  fogDensity = 10 ** params.fogDensity;
+  fogDensity = params.fogDensity > -10 ? 2 ** params.fogDensity : 0;
   monochrome = params.monochrome;
   shadowMap = shadowMapRT.texture;
   splatColors = splatColorsRT.texture;
@@ -99,7 +96,7 @@ THREE.ShaderChunk['gsplats_data'] = /* glsl */`
     float ambientLight;
     float fogDensity;
     bool monochrome;
-    sampler2D shadowMap;
+    sampler2DArray shadowMap;
     sampler2D splatColors;
   };
 `;
@@ -135,10 +132,10 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
     if (len < 0.001)
       return len*gaussian3d(pos);
 
-    float b = dot(pos, dir);   // -INF..INF
-    float h = dot(pos, pos) - b*b;              // 0..INF
-    float s = erf(b + len) - erf(b);          // 0..2
-    return exp(-h)*s*SQRT_PI*0.5;               // 0..sqrt(PI)
+    float b = dot(pos, dir);          // -INF..INF
+    float h = dot(pos, pos) - b*b;    // 0..INF
+    float s = erf(b + len) - erf(b);  // 0..2
+    return exp(-h)*s*SQRT_PI*0.5;     // 0..sqrt(PI)
   }
 
   // integrate( exp(-(pos + dir*t).y), t=0..len )
@@ -189,29 +186,37 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   float gSunDist = 0.;
   vec4 gFogSplat = vec4(0);
   vec4 gFogColor = vec4(0);
+  int gMinShadowMapLayer = 0;
   
   // outputs
-  float bvhSumLight = 1.;
+  float bvhSumShadow = 0.;
   vec4 bvhSumColor = vec4(0);
+  uint bvhNumLookups = 0u;
 
   void bvhInitBounds() {
     vec3 aa = texelFetch1D( bvh.bvhBounds, 0u ).xyz;
     vec3 bb = texelFetch1D( bvh.bvhBounds, 1u ).xyz;
-    vec3 mid = (aa + bb)*0.5;
-    vec3 len = (bb - aa)*0.5;
-    bvhBounds = mat2x3(mid - len, mid + len);
+    bvhBounds = mat2x3(aa, bb);
   }
 
   vec4 integrateSplat(vec4 splat, vec4 color, vec3 pos, vec3 dir, float len) {
-    if (gsd.monochrome)
-      color.rgb = vec3(1)*vmid3(color.rgb);
+    if (splat.w < 1e-6)
+      return vec4(0);
 
-    #if USE_GAMMA
-      color.rgb *= color.rgb;
+    #if NEED_COLOR
+      if (gsd.monochrome)
+        color.rgb = vec3(1)*vmid3(color.rgb);
+
+      #if USE_GAMMA
+        color.rgb *= color.rgb;
+      #endif
     #endif
     
     color.w *= gsd.splatOpacity;
-    color.rgb *= color.w;
+    
+    #if NEED_COLOR
+      color.rgb *= color.w;
+    #endif
 
     // The proper integral would be:
     //
@@ -219,39 +224,49 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     //
     // However rasterizers implicitly multiply opacity of splats
     // by their size, so the splat.w multiplier is omitted here.
-    vec3 r = (pos - splat.xyz) / splat.w;
-    float scale = SQRT_2 / gsd.maxStdDev;
-    float weight = scale*erf3d(r/scale, dir, len/scale); // len*gaussian3d(r/scale)
-    return weight*color;
+    vec3 r = pos - splat.xyz;
+    float scale = SQRT_2 / gsd.maxStdDev * splat.w;
+    float weight = scale * erf3d(r/scale, dir, len/scale);
+    return weight/splat.w * color;
   }
 
   void bvhInitSearch() {
-    bvhSumLight = 1.0;
+    bvhSumShadow = 0.;
     bvhSumColor = vec4(0);
+    bvhNumLookups = 0u;
 
-    if (gFogSplat.w > 0.) {
-      #if NEED_SHADOW
-        float weight = integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, gSunDist).w;
-        bvhSumLight = exp(-weight);
-      #endif
+    #if NEED_SHADOW
+      // find the nearest shadow map layer towards the sun
+      vec3 aa = bvhBounds[0], bb = bvhBounds[1];
+      vec3 p = (gPos - aa) / (bb - aa); // 0..1 x 0..1 x -INF..1
+      float numLayers = float(textureSize(gsd.shadowMap, 0).z);
+      float layer = max(ceil(numLayers * p.z), float(gMinShadowMapLayer));
+      float delta = layer/numLayers - p.z; // 0..1
+      vec3 sun = gSunDir / (bb - aa); // gSunDir.z = 1.0 + eps
+      vec2 uv = p.xy + sun.xy/sun.z * delta; // uv.z = layer/numLayers
 
-      #if NEED_COLOR
-        bvhSumColor = integrateSplat(gFogSplat, gFogColor, 
-          gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
-      #endif
-    }
+      if (layer < numLayers) {
+        bvhSumShadow += 8.0*texture(gsd.shadowMap, vec3(uv, layer)).x;
+        bvhNumLookups++;
+        gSunDist = delta * (bb.z - aa.z)/gSunDir.z;
+        gSunPos = gPos + gSunDir*gSunDist;
+      }
+
+      bvhSumShadow += integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, gSunDist).w;
+    #endif
+
+    #if NEED_COLOR
+      bvhSumColor = integrateSplat(gFogSplat, gFogColor, gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
+    #endif
   }
 
   bool bvhVisitBoundingBox(vec3 boundsMin, vec3 boundsMax) {
-    if (bvhSumLight < 0.001*gsd.brightness)
-      return false;
-    
     #if NEED_SHADOW
     
       vec2 tt = rayBox( gPos, gSunDir, boundsMin, boundsMax );
       tt.x = max(tt.x, 0.);
       tt.y = min(tt.y, gSunDist);
-      return tt.x < tt.y;
+      return tt.x <= tt.y;
 
     #else 
 
@@ -261,13 +276,13 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   }
 
   bool bvhVisitSplat(uint splatId) {
-    if (bvhSumLight < 0.001*gsd.brightness)
+    vec4 splat = texelFetch1D( bvh.position, splatId );
+    
+    if (splat.w < 1e-6)
       return false;
 
-    vec4 splat = texelFetch1D( bvh.position, splatId );
-    // splat.w = original radius * global scale
     vec3 r = (gPos - splat.xyz) / splat.w;
-    float rd = dot(r, gSunDir);
+    float rd = clamp(dot(r, -gSunDir), 0., gSunDist/splat.w);
     float r2 = dot(r, r);
     float h2 = r2 - rd*rd; // h2 < r2
     vec4 color = vec4(0);
@@ -278,8 +293,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     // see if the sunray intersects the splat
     #if NEED_SHADOW
       if (h2 < 1.) {
-        float weight = integrateSplat(splat, color, gPos, gSunDir, gSunDist).w;
-        bvhSumLight *= exp(-weight);
+        bvhSumShadow += integrateSplat(splat, color, gPos, gSunDir, gSunDist).w;
       }
     #endif
 
@@ -291,9 +305,8 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
         // to be scaled by the splat size: integrate(exp(-1/2 * |r/s|^2)) = sqrt(2*PI)*s
         // This means that rasterizers implicitly scale the density of splats and this
         // must to be accounted for here.
-        vec4 dens = integrateSplat(splat, color, 
-          gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
-        bvhSumColor += dens/splat.w;
+        vec4 dens = integrateSplat(splat, color, gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
+        bvhSumColor += dens;
       }
     #endif
 
@@ -444,7 +457,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
         RAY_STEP: 0.001,
         BVH_STACK_DEPTH: 64,
-        INTEGRATE_FOG: 0,
+        INTEGRATE_FOG: 1,
         NEED_SHADOW: 1,
         NEED_COLOR: 1,
 
@@ -497,12 +510,13 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
         #include <common>
         #include <unpack_4x16>
 
-        // Fast fog integration over a ray not occluded by shadows.
+        // Fast fog integration outside the AABB bounding box.
         vec4 integrateFog(vec3 pos, vec3 dir, float len) {
+          const int N = 64;
           vec4 sum = vec4(0);
 
-          for (int i = 0; i < 64; i++) {
-            float dt = len / 64.;
+          for (int i = 0; i < N; i++) {
+            float dt = len / float(N);
             float t = float(i)*dt;
             vec3 p = pos + dir*t;
             vec3 sunDir = gSunPos - p;
@@ -517,7 +531,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
               lum += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
             #endif
 
-            vec4 vol = integrateSplat(gFogSplat, gFogColor, p, dir, dt);
+            vec4 vol = integrateSplat(gFogSplat, gFogColor, p, dir, 1e-9)/1e-9*dt;
             vol.rgb *= lum;
             
             sum.rgb += exp(-sum.w) * vol.rgb;
@@ -527,11 +541,12 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           return sum;
         }
 
+        // Integrates fog outside the AABB and advances the ray to the AABB.
         bool skipFog(vec3 rayOrigin, vec3 rayDir, inout vec4 rayData, inout vec4 color) {
           vec3 aa = bvhBounds[0];
           vec3 bb = bvhBounds[1];
 
-          aa.z -= (bb.z - aa.z)*2.5; // the shadow that the AABB box casts
+          aa.z -= (bb.z - aa.z)*15.; // the shadow that the AABB box casts
 
           // rayOrigin doesn't change, but rayData.z does
           vec2 tt = rayBox(rayOrigin, rayDir, aa, bb);
@@ -575,27 +590,11 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
         }
 
         bool blendSplats(vec3 rayOrigin, vec3 rayDir, inout vec4 rayData, inout vec4 color) {
-          vec3 aa = bvhBounds[0];
-          vec3 bb = bvhBounds[1];
+          bvhSearchSplats( bvh );
+          rayData.w += float(bvhStats.numLookupsBVH + bvhStats.numLookupsSplats + bvhNumLookups);
           
-          if (gFogSplat.w > 0. && gPos.z < aa.z && gPos.xy == clamp(gPos.xy, aa.xy, bb.xy)) {
-            #if NEED_SHADOW
-              vec2 uv = (gPos.xy - aa.xy) / (bb.xy - aa.xy); // 0..1
-              bvhSumLight = texture(gsd.shadowMap, uv).x;
-              rayData.w += 1.;
-
-              float weight = integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, aa.z - gPos.z).w;
-              bvhSumLight *= exp(-weight);
-            #endif
-
-            #if NEED_COLOR
-              bvhSumColor = integrateSplat(gFogSplat, gFogColor, 
-                gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
-            #endif
-          } else {
-            bvhSearchSplats( bvh );
-            rayData.w += float(bvhStats.numLookupsBVH + bvhStats.numLookupsSplats);
-          }
+          if (isnan(dot(bvhSumColor,bvhSumColor)) || isnan(bvhSumShadow))
+            bvhSumColor = vec4(0), bvhSumShadow = 0.;
 
           if (bvhSumColor.w <= 0. && gFogSplat.w == 0.)
             return false;
@@ -603,7 +602,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           float luminance = gsd.brightness;
 
           #if NEED_SHADOW
-            luminance *= bvhSumLight;
+            luminance *= exp(-bvhSumShadow);
             luminance += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
           #endif
 
@@ -619,10 +618,8 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
         vec4 compress(vec4 rayData, vec4 color) {
           color.w /= 8.;
-          if (color.w >= 0.999)
+          if (color.w > 0.999)
               rayData.z = INFINITY;
-          if (rayData.z >= INFINITY)
-            color.w = 1.0;
           rayData.xy = PACK_4x16(color);
           return rayData;
         }
@@ -640,7 +637,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           // .w = accumulated cost
           vec2 size = vec2(textureSize(pixelData, 0));
           vec4 rayData = texelFetch(pixelData, ivec2(vUv*size), 0);
-          bool hasFog = gsd.fogDensity > 1./1024.;
+          bool hasFog = gsd.fogDensity > 0.;
 
           if (frameId == 0) {
             rayData.xy = PACK_4x16(vec4(0));
@@ -659,8 +656,8 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
           if (hasFog) {
             // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
-            gFogSplat = vec4(0, 0, 0, gsd.fogDensity);
-            gFogColor = vec4(1, 1, 1, 1./gsd.splatOpacity);
+            gFogSplat = vec4(0, 0, -1, 3.5);
+            gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
           }
 
           gRayDir = rayDir;
@@ -668,8 +665,9 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
           gSunPos = (vec4(lightPos, 1) * inverse(modelWorldMatrix)).xyz;
           gSunDir = normalize(gSunPos - gPos);
           gSunDist = length(gSunPos - gPos);
-          bvhInitBounds();
           bvhRay.dir = gSunDir;
+
+          bvhInitBounds();
 
           vec4 color = UNPACK_4x16(rayData.xy);
           color.w *= 8.; // density range: exp(0)..exp(-8) = 1..0.0003
@@ -715,6 +713,7 @@ class ShadowMapMaterial extends THREE.ShaderMaterial {
         gsd: { value: null },
         modelWorldMatrix: { value: new THREE.Matrix4() },
         lightPos: { value: params.lightPos },
+        uLayer: { value: 0 },
 
       },
 
@@ -737,6 +736,7 @@ class ShadowMapMaterial extends THREE.ShaderMaterial {
         uniform GSplatsData gsd;
         uniform mat4 modelWorldMatrix;
         uniform vec3 lightPos;
+        uniform int uLayer;
 
         #include <yuv_rgb>
         #include <ray_utils>
@@ -747,13 +747,13 @@ class ShadowMapMaterial extends THREE.ShaderMaterial {
         #include <unpack_4x16>
 
         void main() {
-          vec2 ndc = vUv*2.0 - 1.0; // -1..1
-          bool hasFog = gsd.fogDensity > 1./1024.;
+          bool hasFog = gsd.fogDensity > 0.;
+          int numLayers = textureSize(gsd.shadowMap, 0).z;
 
           if (hasFog) {
             // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
-            gFogSplat = vec4(0, 0, 0, gsd.fogDensity);
-            gFogColor = vec4(1, 1, 1, 1./gsd.splatOpacity);
+            gFogSplat = vec4(0, 0, -1, 3.5);
+            gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
           }
 
           bvhInitBounds();
@@ -761,15 +761,17 @@ class ShadowMapMaterial extends THREE.ShaderMaterial {
           vec3 aa = bvhBounds[0];
           vec3 bb = bvhBounds[1];
 
-          gPos = mix(aa, bb, vec3(vUv, 0.));
-          gRayDir = normalize(gSunPos - gPos);
+          gMinShadowMapLayer = uLayer + 1;
+          gPos = mix(aa, bb, vec3(vUv, float(uLayer)/float(numLayers)));
           gSunPos = (vec4(lightPos, 1) * inverse(modelWorldMatrix)).xyz;
           gSunDir = normalize(gSunPos - gPos);
           gSunDist = length(gSunPos - gPos);
+          gRayDir = gSunDir;
+          bvhRay.dir = gSunDir;
 
           bvhSearchSplats( bvh );
           
-          gl_FragColor = bvhSumLight*vec4(1);
+          gl_FragColor.x = bvhSumShadow/8.0;
         }`
     });
   }
@@ -978,10 +980,8 @@ class OutputMaterial extends THREE.ShaderMaterial {
   constructor() {
     super({
       uniforms: {
-        showCost: { value: true },
-        showProgress: { value: false },
         pixelData: { value: null },
-        shadowMap: { value: null },
+        frameId: { value: 0 },
         gsd: { value: null },
       },
 
@@ -997,8 +997,7 @@ class OutputMaterial extends THREE.ShaderMaterial {
         in vec2 vUv;
 
         uniform sampler2D pixelData;
-        uniform bool showCost;
-        uniform bool showProgress;
+        uniform int frameId;
 
         #include <yuv_rgb>
         #include <unpack_4x16>
@@ -1006,26 +1005,54 @@ class OutputMaterial extends THREE.ShaderMaterial {
         ${BVHShaderGLSL.common_functions}
 
         uniform GSplatsData gsd;
+        vec2 size;
+
+        void drawShadowMap(inout vec4 o) {
+          vec2 uv = vUv*5.0 - vec2(0,4);
+          if (uv != clamp(uv, 0., 1.))
+            return;
+
+          int numLayers = textureSize(gsd.shadowMap, 0).z;
+          int layer = 0; // frameId/120 % numLayers;
+          float shadow = 8.0*texture(gsd.shadowMap, vec3(uv, layer)).x;
+          o.rgb = vec3(1,3,9) * (1. - exp(-shadow));
+        }
+
+        void drawProgress(inout vec4 o) {
+          vec2 uv = vUv*5.0 - vec2(0,0);
+          if (uv != clamp(uv, 0., 1.))
+            return;
+
+          vec4 ray = texelFetch(pixelData, ivec2(uv*size), 0);
+
+          if (ray.z < INFINITY) {
+            float weight = 8.0*UNPACK_4x16(ray.xy).w;
+            o.rgb = vec3(3,1,9) * exp(-weight);
+          }
+        }
+
+        void drawCost(inout vec4 o) {
+          vec2 uv = vUv*5.0 - vec2(4,0);
+          if (uv != clamp(uv, 0., 1.))
+            return;
+
+          float cost = texture(pixelData, uv).w;
+          o.rgb = vec3(9,3,1) * cost/1e5;
+        }
 
         void main() {
-          //gl_FragColor = texture(gsd.shadowMap, vUv).xxxx;
-          //return;
+          size = vec2(textureSize(pixelData, 0));
+          vec4 ray = texelFetch(pixelData, ivec2(vUv*size), 0);
+          vec4 o = UNPACK_4x16(ray.xy);
 
-          vec2 size = vec2(textureSize(pixelData, 0));
-          vec4 o = texelFetch(pixelData, ivec2(vUv*size), 0);
+          #if USE_GAMMA
+            o.rgb = sqrt(o.rgb); // gamma correction
+          #endif
+          //o.rgb += exp(-o.w) * background;
 
-          if (showProgress) {
-            vec4 u = UNPACK_4x16(o.xy);
-            o.rgb = vec3(1,3,9)*(o.z < INFINITY ? 1. - u.w : 0.);
-          } else if (showCost) {
-            o.rgb = vec3(9,3,1) * o.w / 1e6;
-          } else {
-            o = UNPACK_4x16(o.xy);
-            #if USE_GAMMA
-              o.rgb = sqrt(o.rgb); // gamma correction
-            #endif
-            //o.rgb += exp(-o.w) * background;
-          }
+          drawShadowMap(o);
+          drawProgress(o);
+          drawCost(o);
 
           o.w = 1.0;
 
@@ -1120,6 +1147,10 @@ async function init() {
   raymarchingPass.material.updateDefines();
   shadowMapPass = new FullScreenQuad(new ShadowMapMaterial());
   shadowMapPass.material.updateDefines();
+
+  window.params = params;
+  window.THREE = THREE;
+  window.renderer = renderer;
 
   initGeometry();
   rebuildGUI();
@@ -1254,7 +1285,9 @@ function updateBVHMesh() {
     if (i % m == 0)
       index.push(i, i, i);
 
-  outputContainer.textContent = (index.length / 3) + ' splats';
+  let n = index.length / 3;
+  let str = n < 1e3 ? n + '' : (n / 1e3).toFixed(0) + 'K';
+  outputContainer.textContent = str + ' splats';
 
   const baseScale = 2 ** (params.maxStdDev + params.splatScale);
   const scaleAttr = attributes.scale ? attributes.scale.clone() :
@@ -1304,7 +1337,7 @@ function updateBVHMesh() {
   let dx = bbox.max.x - bbox.min.x;
   let dy = bbox.max.y - bbox.min.y;
   let dz = bbox.max.z - bbox.min.z;
-  //console.debug('Bounding box:', dx.toFixed(1), 'x', dy.toFixed(1), 'x', dz.toFixed(1));
+  console.debug('Bounding box:', dx.toFixed(2), 'x', dy.toFixed(2), 'x', dz.toFixed(2));
 
   if (count > 1e5) console.timeEnd('updateBVH');
 }
@@ -1313,7 +1346,7 @@ function rebuildGUI() {
   gui?.destroy();
   gui = new GUI();
   gui.onChange((e) => {
-    if (e.property != 'render' && e.property != 'showProgress' && e.property != 'showCost')
+    if (e.property != 'render')
       clearRenderTargets();
   });
 
@@ -1360,12 +1393,15 @@ function rebuildGUI() {
       nextSplatPass.material.updateDefines();
       raymarchingPass.material.updateDefines();
     });
-    displayFolder.add(params, 'fogDensity', -3.5, +3.5, 0.5).onChange(() => {
+    displayFolder.add(params, 'fogDensity', -10, +10, 0.5).onChange(() => {
       updateShadowMap();
     });
     displayFolder.add(params, 'shadows').onChange(() => {
       raymarchingPass.material.updateDefines();
       shadowMapPass.material.updateDefines();
+      updateShadowMap();
+    });
+    displayFolder.add(params, 'shadowMapLayers', 1, 32, 1).onChange(() => {
       updateShadowMap();
     });
   }
@@ -1385,8 +1421,6 @@ function rebuildGUI() {
       updateShadowMap();
     });
     displayFolder.add(params, 'monochrome');
-    displayFolder.add(params, 'showProgress');
-    displayFolder.add(params, 'showCost');
   }
 }
 
@@ -1423,18 +1457,44 @@ function updateShadowMap() {
   if (!params.shadows)
     return;
 
+  console.time('Update shadowMap');
   pointCloud.updateMatrixWorld();
-  shadowMapRT.setSize(1024, 1024);
+
+  let size = 2048, layers = params.shadowMapLayers;
+  shadowMapRT.setSize(size, size, layers);
+
+  let layerRT = new THREE.WebGLRenderTarget(size, size, { type: THREE.FloatType, format: THREE.RedFormat });
+  let copy = new FullScreenQuad(new THREE.ShaderMaterial(CopyShader));
+  copy.material.uniforms.tDiffuse.value = layerRT.texture;
 
   let u = shadowMapPass.material.uniforms;
   u.bvh.value.updateFrom(bvh);
   u.gsd.value = new GSplatsDataUniformStruct();
-  u.gsd.value.shadowMap = dummyRT.texture;
   u.modelWorldMatrix.value.copy(pointCloud.matrixWorld);
-  renderer.setRenderTarget(shadowMapRT);
-  shadowMapPass.render(renderer);
 
-  console.debug('Updated shadow map');
+  for (let i = layers - 1; i >= 0; i--) {
+    u.uLayer.value = i;
+    renderer.setRenderTarget(layerRT);
+    shadowMapPass.render(renderer);
+
+    renderer.setRenderTarget(shadowMapRT, i);
+    copy.render(renderer);
+
+    // No idea why this isn't working.
+    //renderer.copyTextureToTexture(
+    //  layerRT.texture, shadowMapRT.texture,
+    //  null, new THREE.Vector3(0, 0, i));
+  }
+
+  layerRT.dispose();
+  copy.dispose();
+
+  // Read data to CPU to measure time correctly.
+  // This wouldn't work with a 3D texture.
+  renderer.readRenderTargetPixels(shadowMapRT,
+    0, 0, 1, 1, new Uint8Array(4), 0);
+  console.timeEnd('Update shadowMap');
+  clearRenderTargets();
 }
 
 function render() {
@@ -1460,6 +1520,7 @@ function render() {
     pointCloud.updateMatrixWorld();
 
     let uniforms;
+    let gsd = new GSplatsDataUniformStruct();
 
     if (params.mode == 'raytracing') {
       uniforms = raytracingPass.material.uniforms;
@@ -1469,18 +1530,16 @@ function render() {
       uniforms.projectionMatrix.value.copy(camera.projectionMatrix);
       uniforms.modelWorldMatrix.value.copy(pointCloud.matrixWorld);
       uniforms.pixelData.value = pixelsRT1.texture;
-      uniforms.gsd.value = new GSplatsDataUniformStruct();
+      uniforms.gsd.value = gsd;
       renderer.setRenderTarget(pixelsRT2);
       raytracingPass.render(renderer);
     }
 
     if (params.mode == 'raymarching') {
-      let hasFog = 10 ** params.fogDensity > 1 / 1024;
-
-      if (!hasFog) {
+      if (!gsd.fogDensity) {
         uniforms = nextSplatPass.material.uniforms;
         uniforms.bvh.value.updateFrom(bvh);
-        uniforms.gsd.value = new GSplatsDataUniformStruct();
+        uniforms.gsd.value = gsd;
         uniforms.pixelData.value = pixelsRT1.texture;
         uniforms.frameId.value = frameId;
         uniforms.cameraWorldMatrix.value.copy(camera.matrixWorld);
@@ -1494,7 +1553,7 @@ function render() {
 
       uniforms = raymarchingPass.material.uniforms;
       uniforms.bvh.value.updateFrom(bvh);
-      uniforms.gsd.value = new GSplatsDataUniformStruct();
+      uniforms.gsd.value = gsd;
       uniforms.pixelData.value = pixelsRT1.texture;
       uniforms.frameId.value = frameId;
       uniforms.cameraWorldMatrix.value.copy(camera.matrixWorld);
@@ -1505,10 +1564,9 @@ function render() {
     }
 
     uniforms = outputPass.material.uniforms;
-    uniforms.showCost.value = params.showCost;
-    uniforms.showProgress.value = params.showProgress;
+    uniforms.frameId.value = frameId;
     uniforms.pixelData.value = pixelsRT2.texture;
-    uniforms.gsd.value = new GSplatsDataUniformStruct();
+    uniforms.gsd.value = gsd;
     renderer.setRenderTarget(null);
     outputPass.render(renderer);
 
