@@ -130,12 +130,12 @@ export function computeTriangleBounds( geo, target = null, offset = null, count 
     // assuming that splats are spherical
     let sa = 0, sb = 0, sc = 0;
 
-    if (scaleAttr) {
-      let m = scaleAttr.itemSize;
-      sa = scaleAttr.array[ai * m];
-      sb = scaleAttr.array[bi * m];
-      sc = scaleAttr.array[ci * m];
-    }
+    //if (scaleAttr) {
+    //  let m = scaleAttr.itemSize;
+    //  sa = scaleAttr.array[ai * m];
+    //  sb = scaleAttr.array[bi * m];
+    //  sc = scaleAttr.array[ci * m];
+    //}
 
 		// we add the stride and offset here since we access the array directly
 		// below for the sake of performance

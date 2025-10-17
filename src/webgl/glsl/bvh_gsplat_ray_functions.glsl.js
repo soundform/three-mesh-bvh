@@ -42,7 +42,7 @@ bool _bvhSearchSplats(
       bvhStats.numLookupsSplats += count;
 
       for (uint id = 0u; id < count; id++) {
-        uint splatId = uTexelFetch1D( bvh_index, id + offset ).x;
+        uint splatId = uTexelFetch1D( bvh_index, id + offset ).x / 3u;
 
         if (bvhVisitSplat(splatId)) {
           found = true;

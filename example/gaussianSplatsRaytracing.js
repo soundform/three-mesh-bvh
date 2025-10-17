@@ -52,20 +52,19 @@ const getBVHOptions = () => ({
 });
 
 let renderer, camera, scene, orbit, gui, stats, outputContainer;
-let bvh, bvhHelper, pointCloud;
+let bvh, bvhGeometry, bvhHelper, pointCloud;
 let raytracingPass, nextSplatPass, raymarchingPass, shadowMapPass, outputPass;
-let pixelsRT1, pixelsRT2, splatColorsRT;
+let pixelsRT1, pixelsRT2;
+let splatColorsRT = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType });
 let shadowMapRT = new THREE.WebGLArrayRenderTarget(1, 1, 1, { type: THREE.UnsignedShortType, format: THREE.RedFormat });
 let frameId = 0;
 
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
-//const sceneFile = 'models/sportcar.ply';
-//const sceneFile = 'models/bunny.glb';
 const sceneFile = 'models/soundform.ply';
 
 class GSplatsDataUniformStruct {
-  splatsCount = pointCloud.geometry.attributes.position.count;
+  splatsCount = bvhGeometry.attributes.position.count; // (xyz, radius) x N
   maxStdDev = 2 ** params.maxStdDev;
   splatOpacity = 2 ** params.splatOpacity;
   brightness = 2 ** params.brightness;
@@ -189,9 +188,9 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   int gMinShadowMapLayer = 0;
   
   // outputs
-  float bvhSumShadow = 0.;
-  vec4 bvhSumColor = vec4(0);
-  uint bvhNumLookups = 0u;
+  float gSumShadow = 0.;
+  vec4 gSumColor = vec4(0);
+  uint gTexLookups = 0u;
 
   void bvhInitBounds() {
     vec3 aa = texelFetch1D( bvh.bvhBounds, 0u ).xyz;
@@ -218,22 +217,22 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
       color.rgb *= color.w;
     #endif
 
+    float scale = SQRT_2 / gsd.maxStdDev * splat.w;
+    float weight = scale * erf3d((pos - splat.xyz)/scale, dir, len/scale);
+
     // The proper integral would be:
     //
-    //    erf3d((origin - splat.xyz)/splat.w/scale, dir)*splat.w*scale
+    //    erf3d((pos - splat.xyz)/splat.w/scale, dir)*splat.w*scale
     //
     // However rasterizers implicitly multiply opacity of splats
-    // by their size, so the splat.w multiplier is omitted here.
-    vec3 r = pos - splat.xyz;
-    float scale = SQRT_2 / gsd.maxStdDev * splat.w;
-    float weight = scale * erf3d(r/scale, dir, len/scale);
+    // by their size, so the splat.w multiplier is omitted here.    
     return weight/splat.w * color;
   }
 
   void bvhInitSearch() {
-    bvhSumShadow = 0.;
-    bvhSumColor = vec4(0);
-    bvhNumLookups = 0u;
+    gSumShadow = 0.;
+    gSumColor = vec4(0);
+    gTexLookups = 0u;
 
     #if NEED_SHADOW
       // find the nearest shadow map layer towards the sun
@@ -246,17 +245,15 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
       vec2 uv = p.xy + sun.xy/sun.z * delta; // uv.z = layer/numLayers
 
       if (layer < numLayers) {
-        bvhSumShadow += 8.0*texture(gsd.shadowMap, vec3(uv, layer)).x;
-        bvhNumLookups++;
+        gSumShadow += 8.0*texture(gsd.shadowMap, vec3(uv, layer)).x;
+        gTexLookups++;
         gSunDist = delta * (bb.z - aa.z)/gSunDir.z;
         gSunPos = gPos + gSunDir*gSunDist;
       }
-
-      bvhSumShadow += integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, gSunDist).w;
     #endif
 
     #if NEED_COLOR
-      bvhSumColor = integrateSplat(gFogSplat, gFogColor, gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
+      gSumColor = integrateSplat(gFogSplat, gFogColor, gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
     #endif
   }
 
@@ -266,7 +263,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
       vec2 tt = rayBox( gPos, gSunDir, boundsMin, boundsMax );
       tt.x = max(tt.x, 0.);
       tt.y = min(tt.y, gSunDist);
-      return tt.x <= tt.y;
+      return tt.x < tt.y;
 
     #else 
 
@@ -293,7 +290,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     // see if the sunray intersects the splat
     #if NEED_SHADOW
       if (h2 < 1.) {
-        bvhSumShadow += integrateSplat(splat, color, gPos, gSunDir, gSunDist).w;
+        gSumShadow += integrateSplat(splat, color, gPos, gSunDir, gSunDist).w;
       }
     #endif
 
@@ -306,7 +303,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
         // This means that rasterizers implicitly scale the density of splats and this
         // must to be accounted for here.
         vec4 dens = integrateSplat(splat, color, gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
-        bvhSumColor += dens;
+        gSumColor += dens;
       }
     #endif
 
@@ -457,7 +454,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
         RAY_STEP: 0.001,
         BVH_STACK_DEPTH: 64,
-        INTEGRATE_FOG: 1,
+        INTEGRATE_FOG: 0,
         NEED_SHADOW: 1,
         NEED_COLOR: 1,
 
@@ -591,22 +588,23 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
         bool blendSplats(vec3 rayOrigin, vec3 rayDir, inout vec4 rayData, inout vec4 color) {
           bvhSearchSplats( bvh );
-          rayData.w += float(bvhStats.numLookupsBVH + bvhStats.numLookupsSplats + bvhNumLookups);
+          rayData.w += float(bvhStats.numLookupsBVH + bvhStats.numLookupsSplats + gTexLookups);
           
-          if (isnan(dot(bvhSumColor,bvhSumColor)) || isnan(bvhSumShadow))
-            bvhSumColor = vec4(0), bvhSumShadow = 0.;
+          if (isnan(dot(gSumColor,gSumColor)) || isnan(gSumShadow))
+            gSumColor = vec4(0), gSumShadow = 0.;
 
-          if (bvhSumColor.w <= 0. && gFogSplat.w == 0.)
+          if (gSumColor.w <= 0. && gFogSplat.w == 0.)
             return false;
 
           float luminance = gsd.brightness;
 
           #if NEED_SHADOW
-            luminance *= exp(-bvhSumShadow);
+            gSumShadow += integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, INFINITY).w;
+            luminance *= exp(-gSumShadow);
             luminance += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
           #endif
 
-          vec4 vol = bvhSumColor;
+          vec4 vol = gSumColor;
           vol.rgb *= luminance;
           
           color.rgb += exp(-color.w) * vol.rgb;
@@ -656,7 +654,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
 
           if (hasFog) {
             // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
-            gFogSplat = vec4(0, 0, -1, 3.5);
+            gFogSplat = vec4(0, 0, -3, 3);
             gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
           }
 
@@ -752,7 +750,7 @@ class ShadowMapMaterial extends THREE.ShaderMaterial {
 
           if (hasFog) {
             // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
-            gFogSplat = vec4(0, 0, -1, 3.5);
+            gFogSplat = vec4(0, 0, -3, 3);
             gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
           }
 
@@ -771,7 +769,7 @@ class ShadowMapMaterial extends THREE.ShaderMaterial {
 
           bvhSearchSplats( bvh );
           
-          gl_FragColor.x = bvhSumShadow/8.0;
+          gl_FragColor.x = gSumShadow/8.0; // gFogSplat not included
         }`
     });
   }
@@ -1050,7 +1048,7 @@ class OutputMaterial extends THREE.ShaderMaterial {
           #endif
           //o.rgb += exp(-o.w) * background;
 
-          drawShadowMap(o);
+          //drawShadowMap(o);
           drawProgress(o);
           drawCost(o);
 
@@ -1095,7 +1093,7 @@ class SplatColorsMaterial extends THREE.ShaderMaterial {
           vec3 f_dc = texelFetch(ply.f_dc, ivec2(vUv*size), 0).rgb;
           float opacity = texelFetch(ply.opacity, ivec2(vUv*size), 0).x;
 
-          gl_FragColor = vec4(1);
+          gl_FragColor = vec4(1, 0.3, 0.1, 1);
 
           if (!isnan(rgb.x)) gl_FragColor.rgb = rgb/255.;
           if (!isnan(f_dc.x)) gl_FragColor.rgb = f_dc/sqrt(PI)*0.5 + 0.5;
@@ -1186,8 +1184,6 @@ async function selectScene() {
     input.onchange = () => resolve(input.files[0]));
   if (!blob) return;
 
-  splatColorsRT?.dispose();
-  splatColorsRT = null;
   frameId = -1;
 
   console.log('Opening file:', (blob.size / 1e6).toFixed(1), 'MB', blob.name);
@@ -1253,12 +1249,12 @@ async function initGeometry(url = sceneFile, filename) {
   pointCloud.updateMatrixWorld();
 
   updateBVHMesh();
-  updateSplatColors(pointCloud.geometry);
+  updateSplatColors();
   updateShadowMap();
 }
 
-function getSunMatrix4() {
-  let c = params.lightPos.clone().normalize();
+function getSunMatrix4(zAxis = params.lightPos) {
+  let c = zAxis.clone().normalize();
   let b = Math.abs(c.x) > Math.abs(c.z) ?
     new THREE.Vector3(-c.y, c.x, 0).normalize() :
     new THREE.Vector3(0, -c.z, c.y).normalize();
@@ -1272,37 +1268,63 @@ function getSunMatrix4() {
 }
 
 function updateBVHMesh() {
-  const bvhGeometry = new THREE.BufferGeometry();
-  const attributes = pointCloud.geometry.attributes;
+  bvhGeometry = new THREE.BufferGeometry();
+  let attributes = pointCloud.geometry.attributes;
 
-  const index = [];
-  const position = attributes.position.clone();
-  const count = position.count;
+  let m = 1 << params.sparsity;
+  let position = attributes.position;
+  let numSplats = position.count;
+  let numSplatsM = numSplats / m | 0;
 
-  if (count > 1e5) console.time('updateBVH');
-
-  for (let i = 0, m = 1 << params.sparsity; i < count; i++)
-    if (i % m == 0)
-      index.push(i, i, i);
-
-  let n = index.length / 3;
-  let str = n < 1e3 ? n + '' : (n / 1e3).toFixed(0) + 'K';
+  if (numSplatsM > 1e5) console.time('updateBVH');
+  let str = numSplatsM < 1e3 ? numSplatsM : (numSplatsM / 1e3).toFixed(0) + 'K';
   outputContainer.textContent = str + ' splats';
 
-  const baseScale = 2 ** (params.maxStdDev + params.splatScale);
-  const scaleAttr = attributes.scale ? attributes.scale.clone() :
-    new THREE.BufferAttribute(new Float32Array(count), 1);
+  let position3 = new THREE.BufferAttribute(new Float32Array(numSplats * 9), 3); // [xyz, xyz - r, xyz + r]
+  let position4 = new THREE.BufferAttribute(new Float32Array(numSplats * 4), 4); // (xyz, radius)
+  let baseScale = 2 ** (params.maxStdDev + params.splatScale);
+  let defaultScale = attributes.scale && Number.isFinite(attributes.scale.array[0]) ? 0 : 0.0025;
 
-  if (attributes.scale && Number.isFinite(scaleAttr.array[0])) {
-    for (let i = 0; i < scaleAttr.array.length; i++)
-      scaleAttr.array[i] = baseScale * Math.exp(scaleAttr.array[i]);
-  } else {
-    scaleAttr.array.fill(baseScale * 0.0025);
+  for (let i = 0; i < numSplats; i++) {
+    let x = position.array[i * m * 3 + 0];
+    let y = position.array[i * m * 3 + 1];
+    let z = position.array[i * m * 3 + 2];
+    let r = baseScale * (defaultScale || Math.exp(attributes.scale.array[i * m * 3]));
+
+    // this is for GLSL shaders
+
+    position4.array[i * 4 + 0] = x;
+    position4.array[i * 4 + 1] = y;
+    position4.array[i * 4 + 2] = z;
+    position4.array[i * 4 + 3] = r;
+
+    // this is for MeshBVH
+
+    position3.array[i * 9 + 0] = x;
+    position3.array[i * 9 + 1] = y;
+    position3.array[i * 9 + 2] = z;
+
+    position3.array[i * 9 + 3] = x - r;
+    position3.array[i * 9 + 4] = y - r;
+    position3.array[i * 9 + 5] = z - r;
+
+    position3.array[i * 9 + 6] = x + r;
+    position3.array[i * 9 + 7] = y + r;
+    position3.array[i * 9 + 8] = z + r;
+  }
+
+  //console.log('max(position3)', position3.array.reduce((s, x) => Math.max(s, Math.abs(x)), 0));
+  //console.log('max(position4)', position4.array.reduce((s, x) => Math.max(s, Math.abs(x)), 0));
+
+  let index = [];
+
+  for (let i = 0; i < numSplatsM; i++) {
+    let j = i * m * 3;
+    index.push(j + 0, j + 1, j + 2);
   }
 
   bvhGeometry.setIndex(index);
-  bvhGeometry.setAttribute('position', position);
-  bvhGeometry.setAttribute('scale', scaleAttr); // this is for computeTriangleBounds
+  bvhGeometry.setAttribute('position', position3);
   bvhGeometry.computeBoundsTree(getBVHOptions());
 
   // BVH must be aligned with sunrays for best performance
@@ -1317,20 +1339,11 @@ function updateBVHMesh() {
   bvhHelper.opacity = 0.1;
   bvhHelper.update();
 
-  bvh = new MeshBVH(bvhGeometry, getBVHOptions()); // creates the octree
-
-  // (position.xyz, scale.x) -> position.xyzw
-  let position4 = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
-
-  for (let i = 0; i < count; i++) {
-    position4.array[i * 4 + 3] = scaleAttr.array[i * scaleAttr.itemSize];
-    for (let j = 0; j < 3; j++)
-      position4.array[i * 4 + j] = position.array[i * position.itemSize + j];
-  }
-
-  // It would be better if MeshBVH supported
-  // the 'position' attribute with 4 elements (xyzw).
-  position.copy(position4);
+  // GLSL needs 4-element position attr for efficiency, but MeshBVH doesn't support that,
+  // so build the BVH first, and then replace the position attr, as MeshBVH no longer needs it.
+  bvh = new MeshBVH(bvhGeometry, getBVHOptions());
+  bvhGeometry.attributes.position.copy(position4);
+  position3 = null; // it's been replaced with position4
 
   let bbox = new THREE.Box3();
   bvh.getBoundingBox(bbox);
@@ -1339,7 +1352,7 @@ function updateBVHMesh() {
   let dz = bbox.max.z - bbox.min.z;
   console.debug('Bounding box:', dx.toFixed(2), 'x', dy.toFixed(2), 'x', dz.toFixed(2));
 
-  if (count > 1e5) console.timeEnd('updateBVH');
+  if (numSplatsM > 1e5) console.timeEnd('updateBVH');
 }
 
 function rebuildGUI() {
@@ -1424,25 +1437,24 @@ function rebuildGUI() {
   }
 }
 
-function updateSplatColors(geometry) {
-  let attributes = geometry.attributes;
+function updateSplatColors() {
+  // this is computed once when the splats file is loaded
+  let attributes = pointCloud.geometry.attributes;
+  let numSplats = attributes.position.count;
 
   let rgb = new FloatVertexAttributeTexture();
   let f_dc = new FloatVertexAttributeTexture();
   let opacity = new FloatVertexAttributeTexture();
 
-  let dummyAttr = new THREE.BufferAttribute(
-    new Float32Array(attributes.position.count), 1);
-  dummyAttr.array.fill(Number.NaN);
+  let attrNAN = new THREE.BufferAttribute(new Float32Array(numSplats), 1);
+  attrNAN.array.fill(Number.NaN);
 
-  rgb.updateFrom(attributes.rgb || dummyAttr); // 0..255, uint8
-  f_dc.updateFrom(attributes.f_dc || dummyAttr);
-  opacity.updateFrom(attributes.opacity || dummyAttr);
+  rgb.updateFrom(attributes.rgb || attrNAN); // 0..255, uint8
+  f_dc.updateFrom(attributes.f_dc || attrNAN);
+  opacity.updateFrom(attributes.opacity || attrNAN);
 
-  if (!splatColorsRT) {
-    let { width, height } = opacity.image;
-    splatColorsRT = new THREE.WebGLRenderTarget(width, height, { type: THREE.HalfFloatType });
-  }
+  let { width, height } = opacity.image;
+  splatColorsRT.setSize(width, height);
 
   let shader = new FullScreenQuad(new SplatColorsMaterial());
   shader.material.uniforms.ply.value = { f_dc, rgb, opacity };
