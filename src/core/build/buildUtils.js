@@ -5,19 +5,17 @@ let float32Array, uint32Array, uint16Array, uint8Array;
 const MAX_POINTER = Math.pow( 2, 32 );
 
 export function countNodes( node ) {
-	if ( 'count' in node ) {
-		return 1;
-	} else {
-		return 1 + countNodes( node.left ) + countNodes( node.right );
-	}
-}
 
-export function countDepth( node ) {
 	if ( 'count' in node ) {
+
 		return 1;
+
 	} else {
-		return 1 + Math.max(countDepth( node.left ), countDepth( node.right ));
+
+		return 1 + countNodes( node.left ) + countNodes( node.right );
+
 	}
+
 }
 
 export function populateBuffer( byteOffset, node, buffer ) {

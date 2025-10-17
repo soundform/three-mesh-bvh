@@ -64,18 +64,16 @@ float distanceToTriangles(
 ) {
 
 	bool found = false;
-	
+	vec3 localBarycoord;
 	for ( uint i = offset, l = offset + count; i < l; i ++ ) {
 
 		uvec3 indices = uTexelFetch1D( indexAttr, i ).xyz;
-    bool isPoint = indices.x == indices.y && indices.x == indices.z;
 		vec3 a = texelFetch1D( positionAttr, indices.x ).rgb;
 		vec3 b = texelFetch1D( positionAttr, indices.y ).rgb;
 		vec3 c = texelFetch1D( positionAttr, indices.z ).rgb;
 
 		// get the closest point and barycoord
-    vec3 localBarycoord = vec3(1,0,0);
-		vec3 closestPoint = isPoint ? a : closestPointToTriangle( point, a, b, c, localBarycoord );
+		vec3 closestPoint = closestPointToTriangle( point, a, b, c, localBarycoord );
 		vec3 delta = point - closestPoint;
 		float sqDist = dot2( delta );
 		if ( sqDist < closestDistanceSquared ) {
@@ -83,10 +81,10 @@ float distanceToTriangles(
 			// set the output results
 			closestDistanceSquared = sqDist;
 			faceIndices = uvec4( indices.xyz, i );
-			faceNormal = isPoint ? vec3(0) : normalize( cross( a - b, b - c ) );
+			faceNormal = normalize( cross( a - b, b - c ) );
 			barycoord = localBarycoord;
 			outPoint = closestPoint;
-			side = isPoint ? 1.0 : sign( dot( faceNormal, delta ) ); // inside/outside
+			side = sign( dot( faceNormal, delta ) );
 
 		}
 
@@ -175,9 +173,7 @@ float _bvhClosestPointToPoint(
 			uint leftIndex = currNodeIndex + 1u;
 			uint splitAxis = boundsInfo.x & 0x0000ffffu;
 			uint rightIndex = boundsInfo.y;
-      float lhs = distanceSqToBVHNodeBoundsPoint( point, bvh_bvhBounds, leftIndex );
-      float rhs = distanceSqToBVHNodeBoundsPoint( point, bvh_bvhBounds, rightIndex );
-			bool leftToRight = lhs < rhs; // rayDirection[ splitAxis ] >= 0.0;
+			bool leftToRight = distanceSqToBVHNodeBoundsPoint( point, bvh_bvhBounds, leftIndex ) < distanceSqToBVHNodeBoundsPoint( point, bvh_bvhBounds, rightIndex );//rayDirection[ splitAxis ] >= 0.0;
 			uint c1 = leftToRight ? leftIndex : rightIndex;
 			uint c2 = leftToRight ? rightIndex : leftIndex;
 

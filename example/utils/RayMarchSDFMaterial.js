@@ -9,7 +9,6 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 			defines: {
 
 				MAX_STEPS: 500,
-        SHOW_COST: 0,
 				SURFACE_EPSILON: 0.001,
 
 			},
@@ -50,8 +49,6 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 
 				#include <common>
 
-        #define SDF(p) texture(sdfTex, (p)).x
-
 				// distance to box bounds
 				vec2 rayBoxDist( vec3 boundsMin, vec3 boundsMax, vec3 rayOrigin, vec3 rayDir ) {
 
@@ -91,8 +88,6 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 					float distToBox = boxIntersectionInfo.x;
 					float distInsideBox = boxIntersectionInfo.y;
 					bool intersectsBox = distInsideBox > 0.0;
-          ivec3 sdfTexSize = textureSize(sdfTex, 0);
-          float cost = 0.;
 
 					gl_FragColor = vec4( 0.0 );
 					if ( intersectsBox ) {
@@ -105,12 +100,14 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 						// ray march
 						for ( int i = 0; i < MAX_STEPS; i ++ ) {
 
-              cost += 1./float(MAX_STEPS);
-
 							// sdf box extends from - 0.5 to 0.5
 							// transform into the local bounds space [ 0, 1 ] and check if we're inside the bounds
 							vec3 uv = ( sdfTransformInverse * point ).xyz + vec3( 0.5 );
-              if (clamp(uv, 0., 1.) != uv) break;
+							if ( uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || uv.z < 0.0 || uv.z > 1.0 ) {
+
+								break;
+
+							}
 
 							// get the distance to surface and exit the loop if we're close to the surface
 							float distanceToSurface = texture( sdfTex, uv ).r - surface;
@@ -131,10 +128,10 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 
 							// compute the surface normal
 							vec3 uv = ( sdfTransformInverse * point ).xyz + vec3( 0.5 );
-              float dx = texture( sdfTex, uv + vec3( normalStep.x, 0.0, 0.0 ) ).r - texture( sdfTex, uv - vec3( normalStep.x, 0.0, 0.0 ) ).r;
-              float dy = texture( sdfTex, uv + vec3( 0.0, normalStep.y, 0.0 ) ).r - texture( sdfTex, uv - vec3( 0.0, normalStep.y, 0.0 ) ).r;
-              float dz = texture( sdfTex, uv + vec3( 0.0, 0.0, normalStep.z ) ).r - texture( sdfTex, uv - vec3( 0.0, 0.0, normalStep.z ) ).r;
-              vec3 normal = normalize( vec3( dx, dy, dz ) );
+							float dx = texture( sdfTex, uv + vec3( normalStep.x, 0.0, 0.0 ) ).r - texture( sdfTex, uv - vec3( normalStep.x, 0.0, 0.0 ) ).r;
+							float dy = texture( sdfTex, uv + vec3( 0.0, normalStep.y, 0.0 ) ).r - texture( sdfTex, uv - vec3( 0.0, normalStep.y, 0.0 ) ).r;
+							float dz = texture( sdfTex, uv + vec3( 0.0, 0.0, normalStep.z ) ).r - texture( sdfTex, uv - vec3( 0.0, 0.0, normalStep.z ) ).r;
+							vec3 normal = normalize( vec3( dx, dy, dz ) );
 
 							// compute some basic lighting effects
 							vec3 lightDirection = normalize( vec3( 1.0 ) );
@@ -144,10 +141,6 @@ export class RayMarchSDFMaterial extends ShaderMaterial {
 								0.1;
 							gl_FragColor.rgb = vec3( lightIntensity );
 							gl_FragColor.a = 1.0;
-
-              #if SHOW_COST
-              gl_FragColor.rgb = cost*vec3(9,3,1);
-              #endif
 
 						}
 
