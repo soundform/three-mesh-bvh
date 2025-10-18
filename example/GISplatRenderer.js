@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { CopyShader } from 'three/examples/jsm/shaders/CopyShader.js';
+import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
 import { BVHShaderGLSL, MeshBVHUniformStruct } from 'three-mesh-bvh';
 
 // Uses BVH to compute aggregate density and shadow at the current spot.
@@ -21,6 +23,13 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   vec4 gSumColor = vec4(0);
   int gTexLookups = 0;
 
+  void initFogSplat(mat4 modelWorldMatrix) {
+    gFogSplat = vec4(0, -5, 0, gsd.maxStdDev);
+    gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
+    // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
+    gFogSplat.xyz = (vec4(gFogSplat.xyz, 1) * inverse(modelWorldMatrix)).xyz;
+  }
+
   void bvhInitBounds() {
     vec3 aa = texelFetch1D( bvh.bvhBounds, 0u ).xyz;
     vec3 bb = texelFetch1D( bvh.bvhBounds, 1u ).xyz;
@@ -31,19 +40,13 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   vec4 integrateSplat(vec4 splat, vec4 color, vec3 pos, vec3 dir, float len) {
     if (splat.w < 1e-6)
       return vec4(0);
-
-    #if NEED_COLOR
-      if (gsd.monochrome)
-        color.rgb = vec3(1)*vmid3(color.rgb);
-
-      #if USE_GAMMA
-        color.rgb *= color.rgb;
-      #endif
-    #endif
     
     color.w *= gsd.splatOpacity;
     
     #if NEED_COLOR
+      #if USE_GAMMA
+        color.rgb *= color.rgb;
+      #endif
       color.rgb *= color.w;
     #endif
 
@@ -78,7 +81,6 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
         gSumShadow += 8.0*texture(gsd.shadowMap, vec3(uv, layer)).x;
         gTexLookups++;
         gSunDist = delta * (bb.z - aa.z)/gSunDir.z;
-        gSunPos = gPos + gSunDir*gSunDist;
       }
     #endif
 
@@ -288,7 +290,7 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
 
         RAY_STEP: 0.001,
         BVH_STACK_DEPTH: 64,
-        INTEGRATE_FOG: 0,
+        INTEGRATE_FOG: 256,
         NEED_SHADOW: 1,
         NEED_COLOR: 1,
 
@@ -344,11 +346,10 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
 
         // Fast fog integration outside the AABB bounding box.
         vec4 integrateFog(vec3 pos, vec3 dir, float len) {
-          const int N = 64;
           vec4 sum = vec4(0);
 
-          for (int i = 0; i < N; i++) {
-            float dt = len / float(N);
+          for (int i = 0; i < INTEGRATE_FOG; i++) {
+            float dt = len / float(INTEGRATE_FOG);
             float t = float(i)*dt;
             vec3 p = pos + dir*t;
             vec3 sunDir = gSunPos - p;
@@ -425,9 +426,6 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           bvhSearchSplats( bvh );
           
           pd.cost += bvhTexLookups + gTexLookups;
-          
-          //if (isnan(dot(gSumColor, vec4(1))) || isnan(gSumShadow))
-          //  gSumColor = vec4(0), gSumShadow = 0.;
 
           if (gSumColor.w <= 0. && gFogSplat.w == 0.)
             return false;
@@ -435,7 +433,8 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           float luminance = gsd.brightness;
 
           #if NEED_SHADOW
-            gSumShadow += integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, gSunDist).w;
+            float dist = length(gSunPos - gPos); // shadowMap doesn't include fog
+            gSumShadow += integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, dist).w;
             luminance *= exp(-gSumShadow);
             luminance += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
           #endif
@@ -452,7 +451,7 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
 
         vec4 compress(PixelData pd) {
           pd.color.w /= 8.;
-          if (pd.color.w > 0.999)
+          if (pd.color.w >= 1.0)
               pd.zDepth = INFINITY;
           return packPixelData(pd);
         }
@@ -467,13 +466,13 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
 
           vec2 size = vec2(textureSize(pixelData, 0));
           vec4 rayData = texelFetch(pixelData, ivec2(vUv*size), 0);
-          bool hasFog = gsd.fogDensity > 0.;
 
           if (frameId == 0) {
             PixelData pd = unpackPixelData(rayData);
             pd.color = vec4(0);
             // NextSplatMaterial runs first when fog=0
-            if (hasFog) pd.zDepth = 0., pd.cost = 0;
+            if (gsd.fogDensity > 0.)
+              pd.zDepth = 0., pd.cost = 0;
             rayData = packPixelData(pd);
           }
 
@@ -486,11 +485,8 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
             return;
           }
 
-          if (hasFog) {
-            // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
-            gFogSplat = vec4(0, 0, -3, 3);
-            gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
-          }
+          if (gsd.fogDensity > 0.)
+            initFogSplat(modelWorldMatrix);
 
           gRayDir = rayDir;
           gPos = rayOrigin + rayDir * rayData.z;
@@ -504,7 +500,7 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           PixelData pd = unpackPixelData(rayData);
           pd.color.w *= 8.; // density range: exp(0)..exp(-8) = 1..0.0003
 
-          if (hasFog && skipFog(rayOrigin, rayDir, pd.zDepth, pd.color)) {
+          if (gsd.fogDensity > 0. && skipFog(rayOrigin, rayDir, pd.zDepth, pd.color)) {
             // ...
           } else if (!blendSplats(rayOrigin, rayDir, pd)) {
             pd.zDepth *= -1.; // tell NextSplatMaterial to find the next splat
@@ -575,14 +571,10 @@ export class ShadowMapMaterial extends THREE.ShaderMaterial {
         #include <unpack_4x16>
 
         void main() {
-          bool hasFog = gsd.fogDensity > 0.;
           int numLayers = textureSize(gsd.shadowMap, 0).z;
 
-          if (hasFog) {
-            // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
-            gFogSplat = vec4(0, 0, -3, 3);
-            gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
-          }
+          if (gsd.fogDensity > 0.)
+            initFogSplat(modelWorldMatrix);
 
           bvhInitBounds();
 
@@ -603,4 +595,49 @@ export class ShadowMapMaterial extends THREE.ShaderMaterial {
         }`
     });
   }
+}
+
+export function updateShadowMapGI(renderer, params, shadowMapRT, bvh, gsd, pointCloud) {
+  console.time('Update shadowMap');
+
+  let size = 2048, layers = params.shadowMapLayers;
+  shadowMapRT.setSize(size, size, layers);
+
+  let layerRT = new THREE.WebGLRenderTarget(size, size, { type: THREE.FloatType, format: THREE.RedFormat });
+  let copy = new FullScreenQuad(new THREE.ShaderMaterial(CopyShader));
+  copy.material.uniforms.tDiffuse.value = layerRT.texture;
+
+  let shadowMapPass = new FullScreenQuad(new ShadowMapMaterial(params));
+  shadowMapPass.material.updateDefines(params);
+
+  let u = shadowMapPass.material.uniforms;
+  u.bvh.value.updateFrom(bvh);
+  u.gsd.value = gsd;
+  pointCloud.updateMatrixWorld();
+  u.modelWorldMatrix.value.copy(pointCloud.matrixWorld);
+
+  for (let i = layers - 1; i >= 0; i--) {
+    u.uLayer.value = i;
+    renderer.setRenderTarget(layerRT);
+    shadowMapPass.render(renderer);
+
+    renderer.setRenderTarget(shadowMapRT, i);
+    copy.render(renderer);
+
+    // No idea why this isn't working.
+    //renderer.copyTextureToTexture(
+    //  layerRT.texture, shadowMapRT.texture,
+    //  null, new THREE.Vector3(0, 0, i));
+  }
+
+  shadowMapPass.dispose();
+  layerRT.dispose();
+  copy.dispose();
+
+  // Read data to CPU to measure time correctly.
+  // This wouldn't work with a 3D texture.
+  renderer.readRenderTargetPixels(shadowMapRT,
+    0, 0, 1, 1, new Uint8Array(4), 0);
+  renderer.setRenderTarget(null);
+  console.timeEnd('Update shadowMap');
 }
