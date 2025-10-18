@@ -24,7 +24,7 @@ bool _bvhSearchSplats(sampler2D bvh_position, usampler2D bvh_index, sampler2D bv
 		uint nodeId = stack[ ptr-- ];
     vec3 boundsMin = texelFetch1D( bvh_bvhBounds, nodeId * 2u + 0u ).xyz;
     vec3 boundsMax = texelFetch1D( bvh_bvhBounds, nodeId * 2u + 1u ).xyz;
-    bvhTexLookups += 2;
+    bvhTexLookups++;
 
     if (!bvhVisitBoundingBox(boundsMin, boundsMax))
       continue;
