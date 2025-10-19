@@ -1037,8 +1037,12 @@ export function getSunMatrix4(zAxis) {
     0, 0, 0, 1);
 }
 
+export function disposeBVH() {
+  bvh = null;
+  bvhGeometry = null;
+}
+
 export function updateBVH(params, pointCloud, scene) {
-  bvhGeometry = new THREE.BufferGeometry();
   let attributes = pointCloud.geometry.attributes;
 
   let m = 1 << params.sparsity;
@@ -1089,9 +1093,15 @@ export function updateBVH(params, pointCloud, scene) {
     index.push(j + 0, j + 1, j + 2);
   }
 
-  bvhGeometry.setIndex(index);
-  bvhGeometry.setAttribute('position', position3);
-  bvhGeometry.computeBoundsTree(params.bvhOptions);
+  if (!bvhGeometry) {
+    bvhGeometry = new THREE.BufferGeometry();
+    bvhGeometry.setIndex(index);
+    bvhGeometry.setAttribute('position', position3);
+    bvhGeometry.computeBoundsTree(params.bvhOptions);
+  } else {
+    bvhGeometry.attributes.position.copy(position3);
+    bvhGeometry.boundsTree.refit();
+  }
 
   // BVH must be aligned with sunrays for best performance
   let bvhHelperMesh = new THREE.Mesh(bvhGeometry, new THREE.MeshBasicMaterial());
@@ -1102,12 +1112,17 @@ export function updateBVH(params, pointCloud, scene) {
   bvhHelper = new MeshBVHHelper(bvhHelperMesh, params.depth);
   scene.add(bvhHelper);
   bvhHelper.displayParents = true;
-  bvhHelper.opacity = 0.1;
+  bvhHelper.opacity = 0.15;
   bvhHelper.update();
+
+  if (!bvh) {
+    bvh = new MeshBVH(bvhGeometry, params.bvhOptions);
+  } else {
+    bvh.refit();
+  }
 
   // GLSL needs 4-element position attr for efficiency, but MeshBVH doesn't support that,
   // so build the BVH first, and then replace the position attr, as MeshBVH no longer needs it.
-  bvh = new MeshBVH(bvhGeometry, params.bvhOptions);
   bvhGeometry.attributes.position.copy(position4);
   position3 = null; // it's been replaced with position4
 

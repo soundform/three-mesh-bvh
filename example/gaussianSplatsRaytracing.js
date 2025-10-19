@@ -54,6 +54,7 @@ import {
   loadPLY,
   getSunMatrix4,
   updateBVH,
+  disposeBVH,
   updateSplatColors,
   updateShadowMapGI,
   runRaymarchingPass,
@@ -306,10 +307,8 @@ async function sleep(msec) {
 }
 
 async function updateBVHMesh() {
-  let n = pointCloud.geometry.attributes.position.count;
   console.time('updateBVH');
-  let str = n < 1e3 ? n : (n / 1e3).toFixed(0) + 'K';
-  outputContainer.textContent = str + ' splats';
+  outputContainer.textContent = 'Updating BVH...';
   await sleep(0);
 
   bvh = updateBVH(params, pointCloud, scene);
@@ -319,14 +318,22 @@ async function updateBVHMesh() {
   let dx = bbox.max.x - bbox.min.x;
   let dy = bbox.max.y - bbox.min.y;
   let dz = bbox.max.z - bbox.min.z;
-  console.debug('Bounding box:', dx.toFixed(2), 'x', dy.toFixed(2), 'x', dz.toFixed(2));
+  let aabb = dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2);
 
   console.timeEnd('updateBVH');
+  let n = pointCloud.geometry.attributes.position.count;
+  let str = n < 1e3 ? n :
+    n > 1e6 ? (n / 1e6).toFixed(1) + 'K' :
+      (n / 1e3).toFixed(0) + 'K';
+  outputContainer.textContent = str + ' splats | ' + aabb;
+
+  await updateShadowMap();
 }
 
-function updateShadowMap() {
+async function updateShadowMap() {
   if (!params.shadows)
     return;
+
   let gsd = new GSplatsDataUniformStruct(params);
   updateShadowMapGI(renderer, params, bvh, gsd, pointCloud);
   clearRenderTargets();
@@ -390,6 +397,8 @@ async function loadGLTF(url) {
 }
 
 async function initGeometry(url = sceneFile, filename) {
+  disposeBVH();
+
   const geometry = await loadGeometry(url, filename);
   const material = new THREE.PointsMaterial({ color: 0xCCCCCC });
   scene.remove(pointCloud);
@@ -397,15 +406,14 @@ async function initGeometry(url = sceneFile, filename) {
   scene.add(pointCloud);
 
   let sunMatrix = getSunMatrix4(params.lightPos);
-  console.debug('det(sunMatrix) = ' + sunMatrix.determinant());
+  console.debug('det(sunMatrix) = ' + sunMatrix.determinant().toFixed(2));
   pointCloud.geometry.applyMatrix4(sunMatrix.clone().invert());
   pointCloud.matrix = sunMatrix;
   pointCloud.matrixAutoUpdate = false;
   pointCloud.updateMatrixWorld();
 
-  updateBVHMesh();
-  updateSplatColors(renderer, pointCloud);
-  updateShadowMap();
+  await updateSplatColors(renderer, pointCloud);
+  await updateBVHMesh();
 }
 
 function rebuildGUI() {
@@ -424,14 +432,12 @@ function rebuildGUI() {
 
   const pointsFolder = gui.addFolder('points');
 
-  pointsFolder.add(params, 'maxDepth', 4, 64, 1).onChange(v => {
+  pointsFolder.add(params, 'maxDepth', 4, 64, 1).onChange(() => {
     updateShaderDefines(params);
     updateBVHMesh();
-    updateShadowMap();
   });
-  pointsFolder.add(params, 'sparsity', 0, 16, 1).onChange(v => {
+  pointsFolder.add(params, 'sparsity', 0, 16, 1).onChange(() => {
     updateBVHMesh();
-    updateShadowMap();
   });
   pointsFolder.open();
 
@@ -460,11 +466,9 @@ function rebuildGUI() {
   if (params.mode == 'raytracing' || params.mode == 'raymarching') {
     displayFolder.add(params, 'maxStdDev', 0, 3, 0.5).onChange(() => {
       updateBVHMesh();
-      updateShadowMap();
     });
     displayFolder.add(params, 'splatScale', -4, 4, 0.5).onChange(() => {
       updateBVHMesh();
-      updateShadowMap();
     });
     displayFolder.add(params, 'splatOpacity', -4, 8, 0.5).onChange(() => {
       updateShadowMap();
