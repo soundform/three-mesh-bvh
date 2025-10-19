@@ -27,7 +27,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   int gTexLookups = 0;
 
   void initFogSplat(mat4 modelWorldMatrix) {
-    gFogSplat = vec4(0, -5, 0, gsd.maxStdDev);
+    gFogSplat = vec4(0, -3, 0, gsd.maxStdDev);
     gFogColor = vec4(1, 1, 1, gsd.fogDensity/gsd.splatOpacity);
     // (aa, bb) is in sun coords, so vec3(0,0,1) points to the sun
     gFogSplat.xyz = (vec4(gFogSplat.xyz, 1) * inverse(modelWorldMatrix)).xyz;
@@ -364,12 +364,12 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
             float sunDist = length(sunDir);
             sunDir /= sunDist;
 
-            float lum = gsd.brightness;
+            float lum = 1.0;
 
             #if NEED_SHADOW
               float weight = integrateSplat(gFogSplat, gFogColor, p, sunDir, sunDist).w;
               lum *= exp(-weight);
-              lum += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
+              lum *= 1.0 + gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
             #endif
 
             vec4 vol = integrateSplat(gFogSplat, gFogColor, p, dir, dt);
@@ -458,13 +458,13 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           if (gSumColor.w <= 0. && gFogSplat.w == 0.)
             return false;
 
-          float luminance = gsd.brightness;
+          float luminance = 1.0;
 
           #if NEED_SHADOW
             float dist = length(gSunPos - gPos); // shadowMap doesn't include fog
             gSumShadow += integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, dist).w;
             luminance *= exp(-gSumShadow);
-            luminance += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
+            luminance *= 1.0 + gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
           #endif
 
           vec4 vol = gSumColor;

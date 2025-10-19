@@ -40,7 +40,7 @@ const params = {
   fogDensity: -3.0, // exp10
   shadows: false,
   monochrome: false,
-  lightPos: new THREE.Vector3(1e3, 7e3, 2e3),
+  lightPos: new THREE.Vector3(8e3, 1e3, 9e3),
   shadowMapLayers: 16,
 };
 
@@ -66,7 +66,6 @@ class GSplatsDataUniformStruct {
   splatsCount = bvhGeometry.attributes.position.count; // (xyz, radius) x N
   maxStdDev = 2 ** params.maxStdDev;
   splatOpacity = 2 ** params.splatOpacity;
-  brightness = 2 ** params.brightness;
   ambientLight = 2 ** params.ambientLight;
   fogDensity = params.fogDensity > -3 ? 10 ** params.fogDensity : 0;
   shadowMap = shadowMapRT.texture;
@@ -85,7 +84,6 @@ THREE.ShaderChunk['gsplats_data'] = /* glsl */`
     int splatsCount;
     float maxStdDev;
     float splatOpacity;
-    float brightness;
     float ambientLight;
     float fogDensity;
     
@@ -330,7 +328,6 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
             color.rgb *= color.rgb; // blend RGB^2, then output sqrt(RGB)
           #endif
 
-          color.rgb *= gsd.brightness;
           color.w *= gsd.splatOpacity;
           color.w /= gDistScale;
 
@@ -394,6 +391,7 @@ class CanvasDrawMaterial extends THREE.ShaderMaterial {
   constructor() {
     super({
       uniforms: {
+        brightness: { value: 1 },
         monochrome: { value: false },
         pixelData: { value: null },
         frameId: { value: 0 },
@@ -414,6 +412,7 @@ class CanvasDrawMaterial extends THREE.ShaderMaterial {
         uniform sampler2D pixelData;
         uniform int frameId;
         uniform bool monochrome;
+        uniform float brightness;
 
         #include <yuv_rgb>
         #include <unpack_4x16>
@@ -424,7 +423,7 @@ class CanvasDrawMaterial extends THREE.ShaderMaterial {
 
         uniform GSplatsData gsd;
         vec2 size;
-        const int M = 5;
+        const int M = 10;
 
         float vmax3(vec3 v) { return max(max(v.x, v.y), v.z); }
         float vmin3(vec3 v) { return -vmax3(-v); }
@@ -474,6 +473,8 @@ class CanvasDrawMaterial extends THREE.ShaderMaterial {
             // RGB <-> YUV may create negative RGB values
             o.rgb = sqrt(max(o.rgb, vec3(0)));
           #endif
+
+          o.rgb *= brightness;
 
           if (monochrome)
             o.rgb = (vmin3(o.rgb) + vmax3(o.rgb)) * vec3(0.5);
@@ -785,7 +786,7 @@ function rebuildGUI() {
   gui?.destroy();
   gui = new GUI();
   gui.onChange((e) => {
-    if (e.property != 'render' && e.property != 'monochrome')
+    if (e.property != 'render' && e.property != 'monochrome' && e.property != 'brightness')
       clearRenderTargets();
   });
 
@@ -958,6 +959,7 @@ function render() {
     }
 
     uniforms = outputPass.material.uniforms;
+    uniforms.brightness.value = 2 ** params.brightness;
     uniforms.monochrome.value = params.monochrome;
     uniforms.frameId.value = frameId;
     uniforms.pixelData.value = pixelsRT2.texture;
