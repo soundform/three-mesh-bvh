@@ -307,7 +307,6 @@ async function sleep(msec) {
 }
 
 async function updateBVHMesh() {
-  console.time('updateBVH');
   outputContainer.textContent = 'Updating BVH...';
   await sleep(0);
 
@@ -318,14 +317,13 @@ async function updateBVHMesh() {
   let dx = bbox.max.x - bbox.min.x;
   let dy = bbox.max.y - bbox.min.y;
   let dz = bbox.max.z - bbox.min.z;
-  let aabb = dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2);
+  console.log(dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2));
 
-  console.timeEnd('updateBVH');
   let n = pointCloud.geometry.attributes.position.count;
   let str = n < 1e3 ? n :
-    n > 1e6 ? (n / 1e6).toFixed(1) + 'K' :
+    n > 1e6 ? (n / 1e6).toFixed(1) + 'M' :
       (n / 1e3).toFixed(0) + 'K';
-  outputContainer.textContent = str + ' splats | ' + aabb;
+  outputContainer.textContent = str + ' splats';
 
   await updateShadowMap();
 }
@@ -406,7 +404,7 @@ async function initGeometry(url = sceneFile, filename) {
   scene.add(pointCloud);
 
   let sunMatrix = getSunMatrix4(params.lightPos);
-  console.debug('det(sunMatrix) = ' + sunMatrix.determinant().toFixed(2));
+  //console.debug('det(sunMatrix) = ' + sunMatrix.determinant().toFixed(2));
   pointCloud.geometry.applyMatrix4(sunMatrix.clone().invert());
   pointCloud.matrix = sunMatrix;
   pointCloud.matrixAutoUpdate = false;

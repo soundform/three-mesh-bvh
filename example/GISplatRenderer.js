@@ -532,7 +532,7 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
             #if NEED_SHADOW
               float weight = integrateSplat(gFogSplat, gFogColor, p, sunDir, sunDist).w;
               lum *= exp(-weight);
-              lum *= 1.0 + gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
+              lum += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
             #endif
 
             vec4 vol = integrateSplat(gFogSplat, gFogColor, p, dir, dt);
@@ -627,7 +627,7 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
             float dist = length(gSunPos - gPos); // shadowMap doesn't include fog
             gSumShadow += integrateSplat(gFogSplat, gFogColor, gPos, gSunDir, dist).w;
             luminance *= exp(-gSumShadow);
-            luminance *= 1.0 + gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
+            luminance += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
           #endif
 
           vec4 vol = gSumColor;
@@ -1043,6 +1043,8 @@ export function disposeBVH() {
 }
 
 export function updateBVH(params, pointCloud, scene) {
+  console.time('updateBVH');
+
   let attributes = pointCloud.geometry.attributes;
 
   let m = 1 << params.sparsity;
@@ -1112,7 +1114,7 @@ export function updateBVH(params, pointCloud, scene) {
   bvhHelper = new MeshBVHHelper(bvhHelperMesh, params.depth);
   scene.add(bvhHelper);
   bvhHelper.displayParents = true;
-  bvhHelper.opacity = 0.15;
+  bvhHelper.opacity = 0.1;
   bvhHelper.update();
 
   if (!bvh) {
@@ -1125,6 +1127,8 @@ export function updateBVH(params, pointCloud, scene) {
   // so build the BVH first, and then replace the position attr, as MeshBVH no longer needs it.
   bvhGeometry.attributes.position.copy(position4);
   position3 = null; // it's been replaced with position4
+
+  console.timeEnd('updateBVH');
 
   return bvh;
 }
