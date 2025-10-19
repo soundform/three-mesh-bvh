@@ -3,6 +3,8 @@ import { CopyShader } from 'three/examples/jsm/shaders/CopyShader.js';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
 import { BVHShaderGLSL, MeshBVHUniformStruct } from 'three-mesh-bvh';
 
+const SHADOW_MAP_SIZE = 2048;
+
 // Uses BVH to compute aggregate density and shadow at the current spot.
 THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   mat2x3 bvhBounds = mat2x3(0); // min..max or AABB
@@ -21,6 +23,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
   // outputs
   float gSumShadow = 0.;
   vec4 gSumColor = vec4(0);
+  int gShadowMapLayers = 0;
   int gTexLookups = 0;
 
   void initFogSplat(mat4 modelWorldMatrix) {
@@ -62,30 +65,36 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     return weight/splat.w * color;
   }
 
+  vec4 getShadowMapUV() {
+    vec3 aa = bvhBounds[0], bb = bvhBounds[1];
+    vec3 p = (gPos - aa) / (bb - aa); // 0..1 x 0..1 x -INF..1
+    float numLayers = float(gShadowMapLayers);
+    float layer = max(ceil(numLayers * p.z), float(gMinShadowMapLayer));
+    float delta = layer/numLayers - p.z; // 0..1
+    vec3 sun = gSunDir / (bb - aa); // gSunDir.z = 1.0 + eps
+    vec2 uv = p.xy + sun.xy/sun.z * delta; // uv.z = layer/numLayers
+    float dist = delta * (bb.z - aa.z)/gSunDir.z;
+    return vec4(uv, layer, dist);
+  }
+
   void bvhInitSearch() {
     gSumShadow = 0.;
     gSumColor = vec4(0);
     gTexLookups = 0;
+    gShadowMapLayers = textureSize(gsd.shadowMap, 0).z;
 
     #if NEED_SHADOW
-      // find the nearest shadow map layer towards the sun
-      vec3 aa = bvhBounds[0], bb = bvhBounds[1];
-      vec3 p = (gPos - aa) / (bb - aa); // 0..1 x 0..1 x -INF..1
-      float numLayers = float(textureSize(gsd.shadowMap, 0).z);
-      float layer = max(ceil(numLayers * p.z), float(gMinShadowMapLayer));
-      float delta = layer/numLayers - p.z; // 0..1
-      vec3 sun = gSunDir / (bb - aa); // gSunDir.z = 1.0 + eps
-      vec2 uv = p.xy + sun.xy/sun.z * delta; // uv.z = layer/numLayers
+      vec4 uv = getShadowMapUV();
 
-      if (layer < numLayers) {
-        gSumShadow += 8.0*texture(gsd.shadowMap, vec3(uv, layer)).x;
+      if (int(uv.z) < gShadowMapLayers) {
+        gSumShadow += 8.0*texture(gsd.shadowMap, uv.xyz).x;
         gTexLookups++;
-        gSunDist = delta * (bb.z - aa.z)/gSunDir.z;
+        gSunDist = uv.w;
       }
     #endif
 
     #if NEED_COLOR
-      gSumColor = integrateSplat(gFogSplat, gFogColor, gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
+      gSumColor = integrateSplat(gFogSplat, gFogColor, gPos - gRayDir*RAY_STEP*0.5, gRayDir, RAY_STEP);
     #endif
   }
 
@@ -134,8 +143,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
         // to be scaled by the splat size: integrate(exp(-1/2 * |r/s|^2)) = sqrt(2*PI)*s
         // This means that rasterizers implicitly scale the density of splats and this
         // must to be accounted for here.
-        vec4 dens = integrateSplat(splat, color, gPos, gRayDir, 1e-9)/1e-9*RAY_STEP;
-        gSumColor += dens;
+        gSumColor += integrateSplat(splat, color, gPos - gRayDir*RAY_STEP*0.5, gRayDir, RAY_STEP);
       }
     #endif
 
@@ -364,7 +372,7 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
               lum += gsd.ambientLight; // ambient occlusion (AO) or global illumination (GI)
             #endif
 
-            vec4 vol = integrateSplat(gFogSplat, gFogColor, p, dir, 1e-9)/1e-9*dt;
+            vec4 vol = integrateSplat(gFogSplat, gFogColor, p, dir, dt);
             vol.rgb *= lum;
             
             sum.rgb += exp(-sum.w) * vol.rgb;
@@ -374,8 +382,8 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           return sum;
         }
 
-        // Integrates fog outside the AABB and advances the ray to the AABB.
-        bool skipFog(vec3 rayOrigin, vec3 rayDir, inout float zDepth, inout vec4 color) {
+        // Fog outside the AABB can be integrated quickly since no BVH lookups are necessary.
+        bool addExteriorFog(vec3 rayOrigin, vec3 rayDir, inout float zDepth, inout vec4 color) {
           vec3 aa = bvhBounds[0];
           vec3 bb = bvhBounds[1];
 
@@ -422,11 +430,31 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           return false;
         }
 
-        bool blendSplats(vec3 rayOrigin, vec3 rayDir, inout PixelData pd) {
-          bvhSearchSplats( bvh );
-          
-          pd.cost += bvhTexLookups + gTexLookups;
+        // The shadow map can be used to skip empty interior areas.
+        bool isAreaEmpty() {
+          #if !NEED_SHADOW
+            return false; // no shadow map
+          #endif
 
+          vec4 uv = getShadowMapUV();
+          float above = 0.0, below = 1.0;
+
+          if (int(uv.z) == clamp(int(uv.z), 1, gShadowMapLayers - 1)) {
+            above = 8.0*texture(gsd.shadowMap, uv.xyz).x;
+            below = 8.0*texture(gsd.shadowMap, uv.xyz - vec3(0,0,1)).x;
+            gTexLookups += 2;
+          }
+          
+          return abs(above - below) < 0.01;
+        }
+
+        // This applies to points inside the AABB where BVH lookups are necessary.
+        bool blendSplats(inout PixelData pd) {
+          //if (isAreaEmpty())
+          //  return true;
+
+          bvhSearchSplats( bvh );
+          pd.cost += bvhTexLookups + gTexLookups;
           if (gSumColor.w <= 0. && gFogSplat.w == 0.)
             return false;
 
@@ -444,8 +472,6 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           
           pd.color.rgb += exp(-pd.color.w) * vol.rgb;
           pd.color.w += vol.w;
-
-          pd.zDepth += RAY_STEP;
           return true;
         }
 
@@ -500,9 +526,11 @@ export class RaymarchingMaterial extends THREE.ShaderMaterial {
           PixelData pd = unpackPixelData(rayData);
           pd.color.w *= 8.; // density range: exp(0)..exp(-8) = 1..0.0003
 
-          if (gsd.fogDensity > 0. && skipFog(rayOrigin, rayDir, pd.zDepth, pd.color)) {
-            // ...
-          } else if (!blendSplats(rayOrigin, rayDir, pd)) {
+          if (gsd.fogDensity > 0. && addExteriorFog(rayOrigin, rayDir, pd.zDepth, pd.color)) {
+            // nothing to do
+          } else if (blendSplats(pd)) {
+            pd.zDepth += RAY_STEP;
+          } else {
             pd.zDepth *= -1.; // tell NextSplatMaterial to find the next splat
           }
           
@@ -599,8 +627,7 @@ export class ShadowMapMaterial extends THREE.ShaderMaterial {
 
 export function updateShadowMapGI(renderer, params, shadowMapRT, bvh, gsd, pointCloud) {
   console.time('Update shadowMap');
-
-  let size = 2048, layers = params.shadowMapLayers;
+  let size = SHADOW_MAP_SIZE, layers = params.shadowMapLayers;
   shadowMapRT.setSize(size, size, layers);
 
   let layerRT = new THREE.WebGLRenderTarget(size, size, { type: THREE.FloatType, format: THREE.RedFormat });

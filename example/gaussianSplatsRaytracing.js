@@ -40,8 +40,8 @@ const params = {
   fogDensity: -3.0, // exp10
   shadows: false,
   monochrome: false,
-  lightPos: new THREE.Vector3(4e3, 5e3, 3e3),
-  shadowMapLayers: 1,
+  lightPos: new THREE.Vector3(1e3, 7e3, 2e3),
+  shadowMapLayers: 16,
 };
 
 const getBVHOptions = () => ({
@@ -154,8 +154,8 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
   // 2/sqrt(PI) * integrate( exp(-|pos + dir*t|^2), t=0..len )
   // https://en.wikipedia.org/wiki/Gaussian_integral
   float erf3d(vec3 pos, vec3 dir, float len) {
-    if (len < 0.001)
-      return len*gaussian3d(pos);
+    if (len < 0.01)
+      return len*gaussian3d(pos + dir*len*0.5);
 
     float b = dot(pos, dir);          // -INF..INF
     float h = dot(pos, pos) - b*b;    // 0..INF
@@ -169,7 +169,7 @@ THREE.ShaderChunk['gaussian_utils'] = /* glsl */`
     float d = dot(dir, up);
     float p = dot(pos, up);
 
-    if (abs(len * d) < 0.001)
+    if (abs(len * d) < 0.01)
       return exp(-p) * len;
 
     return exp(-p) * (1.0 - exp(-len * d)) / d;
@@ -202,7 +202,6 @@ import {
   updateShadowMapGI,
   NextSplatMaterial,
   RaymarchingMaterial,
-  ShadowMapMaterial,
 } from './GISplatRenderer.js';
 
 // Finds the nearest 8 splats, blends them, then repeats the same at the next frame.
@@ -264,6 +263,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
 
         vec3 bvhRayDir;
         vec3 gRayOrigin;
+        float gDistScale = 1.0;
         mat4 gSplats; // the closest 8 splats sorted by distance
 
         void bvhInitSearch() {
@@ -282,25 +282,23 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
           if (splat.w < 1e-6)
               return false;
           
-          // TODO: Multiply r by the distance from the screen.
-          // True rendering needs to capture all splats that
-          // map to a pixel, not just intersect with a ray.
-          vec3 r = (gRayOrigin - splat.xyz) / splat.w;
+          float r0 = splat.w;
+          vec3 r = (gRayOrigin - splat.xyz) / r0;
           
           float t = dot(r, -bvhRayDir);
-          float h = t*t + 1. - dot(r, r);
+          float h = dot(r, r) - t*t;
 
-          if (h <= 0. || t <= 0. || t*splat.w >= gSplats[3].z)
+          // TODO: Multiply sqrt(h) by the distance from the screen.
+          // True rendering needs to capture all splats that map
+          // to a pixel, not just those that intersect with a ray.
+          if (h >= gDistScale || t <= 0. || t*r0 >= gSplats[3].z)
             return false;          
 
-          // this list is sorted by .x:
-          //    a.xy, a.zw, b.xy, b.zw, 
-          //    c.xy, c.zw, d.xy, d.zw ... s.xy
-          vec4 a = gSplats[0];
-          vec4 b = gSplats[1];
-          vec4 c = gSplats[2];
-          vec4 d = gSplats[3];
-          vec2 s = vec2(t*splat.w, splatId);
+          vec4 a = gSplats[0]; // a.x <= a.z <= b.x
+          vec4 b = gSplats[1]; // b.x <= b.z <= c.x
+          vec4 c = gSplats[2]; // c.x <= c.z <= d.x
+          vec4 d = gSplats[3]; // d.x <= d.z
+          vec2 s = vec2(t*r0, splatId);
           
           if (s.x < d.z) d.zw = s.xy;
           if (d.z < d.x) d = d.zwxy;
@@ -319,12 +317,12 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
 
         ///// splat color blending ///////////////////////////////////////////
         
-        void blendSplat(vec2 entry, inout vec4 sumColor) {
+        bool blendSplat(vec2 entry, inout vec4 sumColor) {
           uint splatId = uint(entry.y);
           float dist = entry.x;
 
           if (dist >= INFINITY || sumColor.w >= 1.0)
-            return;
+            return false;
           
           vec4 splat = texelFetch1D(bvh.position, splatId);
           vec4 color = texelFetch1D(gsd.splatColors, splatId);
@@ -335,13 +333,15 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
 
           color.rgb *= gsd.brightness;
           color.w *= gsd.splatOpacity;
+          color.w /= gDistScale;
 
           // rasterizer-style blending: splats are approximated with flat ellipses
           vec3 r = (gRayOrigin + bvhRayDir*dist - splat.xyz) / splat.w;
-          color.w *= gaussian3d(r * gsd.maxStdDev / SQRT_2);
+          color.w *= gaussian3d(r * gsd.maxStdDev / SQRT_2 / gDistScale);
 
           color.rgb *= color.w;
           sumColor += (1. - sumColor.w) * color;
+          return true;
         }
         
         void main() {
@@ -369,17 +369,18 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
           
           bvhRayDir = normalize(rayDirection);
           gRayOrigin = rayOrigin + pd.zDepth * bvhRayDir;
+          //gDistScale = 1.0 + pd.zDepth/length(rayOrigin);
           bvhSearchSplats( bvh );
           pd.cost += bvhTexLookups; // total cost
           vec4 rgba = pd.color;
 
-          blendSplat(gSplats[0].xy, rgba);
-          blendSplat(gSplats[0].zw, rgba);
-          blendSplat(gSplats[1].xy, rgba);
-          blendSplat(gSplats[1].zw, rgba);
-          blendSplat(gSplats[2].xy, rgba);
-          blendSplat(gSplats[2].zw, rgba);
-          blendSplat(gSplats[3].xy, rgba);
+          blendSplat(gSplats[0].xy, rgba) &&
+          blendSplat(gSplats[0].zw, rgba) &&
+          blendSplat(gSplats[1].xy, rgba) &&
+          blendSplat(gSplats[1].zw, rgba) &&
+          blendSplat(gSplats[2].xy, rgba) &&
+          blendSplat(gSplats[2].zw, rgba) &&
+          blendSplat(gSplats[3].xy, rgba) &&
           blendSplat(gSplats[3].zw, rgba);
           
           pd.color = rgba;
@@ -424,7 +425,7 @@ class CanvasDrawMaterial extends THREE.ShaderMaterial {
 
         uniform GSplatsData gsd;
         vec2 size;
-        const int M = 10;
+        const int M = 5;
 
         float vmax3(vec3 v) { return max(max(v.x, v.y), v.z); }
         float vmin3(vec3 v) { return -vmax3(-v); }
@@ -435,7 +436,7 @@ class CanvasDrawMaterial extends THREE.ShaderMaterial {
             return;
 
           int numLayers = textureSize(gsd.shadowMap, 0).z;
-          int layer = 0; // frameId/120 % numLayers;
+          int layer = frameId/60 % numLayers;
           float shadow = 8.0*texture(gsd.shadowMap, vec3(uv, layer)).x;
           o.rgb = vec3(1,3,9) * (1. - exp(-shadow));
         }
@@ -478,18 +479,16 @@ class CanvasDrawMaterial extends THREE.ShaderMaterial {
           if (monochrome)
             o.rgb = (vmin3(o.rgb) + vmax3(o.rgb)) * vec3(0.5);
 
-          //o.rgb += exp(-o.w) * background;
+          //o.rgb += exp(-o.w) * backgroundRGB;
 
           //drawShadowMap(o);
           drawProgress(o);
           drawCost(o);
 
-          o.w = 1.0;
-
           if (isnan(dot(o, vec4(1))))
-            o.rgb = vec3(0,1,0);
+            o = vec4(0,1,0,1);
 
-          gl_FragColor = o;
+          gl_FragColor = vec4(o.rgb, 1);
         }`
     });
   }
@@ -823,7 +822,7 @@ function rebuildGUI() {
   });
 
   if (params.mode === 'raymarching') {
-    displayFolder.add(params, 'rayStep', -3, -1, 0.25).onChange(() => {
+    displayFolder.add(params, 'rayStep', -3, -1, 0.5).onChange(() => {
       nextSplatPass.material.updateDefines(params);
       raymarchingPass.material.updateDefines(params);
     });
