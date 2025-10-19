@@ -282,8 +282,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
           if (splat.w < 1e-6)
               return false;
           
-          float r0 = splat.w;
-          vec3 r = (gRayOrigin - splat.xyz) / r0;
+          vec3 r = (gRayOrigin - splat.xyz) / splat.w;
           
           float t = dot(r, -bvhRayDir);
           float h = dot(r, r) - t*t;
@@ -291,14 +290,14 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
           // TODO: Multiply sqrt(h) by the distance from the screen.
           // True rendering needs to capture all splats that map
           // to a pixel, not just those that intersect with a ray.
-          if (h >= gDistScale || t <= 0. || t*r0 >= gSplats[3].z)
+          if (h >= gDistScale || t <= 0. || t*splat.w >= gSplats[3].z)
             return false;          
 
           vec4 a = gSplats[0]; // a.x <= a.z <= b.x
           vec4 b = gSplats[1]; // b.x <= b.z <= c.x
           vec4 c = gSplats[2]; // c.x <= c.z <= d.x
           vec4 d = gSplats[3]; // d.x <= d.z
-          vec2 s = vec2(t*r0, splatId);
+          vec2 s = vec2(t*splat.w, splatId);
           
           if (s.x < d.z) d.zw = s.xy;
           if (d.z < d.x) d = d.zwxy;
