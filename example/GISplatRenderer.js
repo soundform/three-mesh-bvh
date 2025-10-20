@@ -65,8 +65,6 @@ THREE.ShaderChunk['gsplats_data'] = /* glsl */`
 `;
 
 THREE.ShaderChunk['unpack_4x16'] = /* glsl */`
-  #define pack2(xy) uintBitsToFloat(packHalf2x16(vec2(xy)))
-  #define unpack2(f32) unpackHalf2x16(floatBitsToUint(float(f32)))
   // float 0..1 <-> uint 0..65535
   #define PACK_2x16(xy)   uintBitsToFloat(packUnorm2x16(vec2(xy)))
   #define PACK_4x16(v)    vec2(PACK_2x16(v.xy), PACK_2x16(v.zw))
@@ -75,6 +73,8 @@ THREE.ShaderChunk['unpack_4x16'] = /* glsl */`
 `;
 
 THREE.ShaderChunk['pack_pixel_data'] = /* glsl */`
+  #define SHOW_COST 1
+
   struct PixelData { 
     vec4 color; // .w < 1.0 - the accumulated density
     float zDepth; 
@@ -82,24 +82,41 @@ THREE.ShaderChunk['pack_pixel_data'] = /* glsl */`
   };
 
   vec4 packPixelData(PixelData pd) {
+    //pd.color.rgb = sqrt(max(pd.color.rgb, 0.));
     vec3 yuv = pd.color.rgb * RGB_YUV;
     vec4 pixel;
     pixel.x = yuv.x; // Y' of Y'UV
-    pixel.y = pack2(yuv.yz); // UV of Y'UV, as 2 x float16
+    pixel.y = PACK_2x16(yuv.yz + 0.5); // UV of Y'UV, with 16 bits accuracy
     pixel.z = pd.zDepth;
-    pixel.w = PACK_2x16(vec2(pd.color.w, float(pd.cost) / float(0xFFFF)));
+
+    #if SHOW_COST
+      pixel.w = PACK_2x16(vec2(pd.color.w, float(pd.cost) / float(0xFFFF)));
+    #else
+      pixel.w = pd.color.w; // 24 bits accuracy, but 16 seems enough
+    #endif
+
     return pixel;
   }
 
   PixelData unpackPixelData(vec4 pixel) {
+    PixelData pd;
+
     vec3 yuv;
     yuv.x = pixel.x;
-    yuv.yz = unpack2(pixel.y);
-    vec2 wc = UNPACK_2x16(pixel.w);
-    PixelData pd;
-    pd.color = vec4(yuv * YUV_RGB, wc.x);
+    yuv.yz = UNPACK_2x16(pixel.y) - 0.5;
+    vec3 rgb = max(yuv * YUV_RGB, 0.);
+    //rgb *= rgb;
+    pd.color = vec4(rgb, 1);
+
+    #if SHOW_COST
+      vec2 wc = UNPACK_2x16(pixel.w);
+      pd.color.w = wc.x;
+      pd.cost = int(wc.y * float(0xFFFF));
+    #else
+      pd.color.w = pixel.w;
+    #endif
+
     pd.zDepth = pixel.z;
-    pd.cost = int(wc.y * float(0xFFFF));
     return pd;
   }
 `;
@@ -225,7 +242,7 @@ THREE.ShaderChunk['bvh_shadows_raycasting'] = /* glsl */`
     //
     // However rasterizers implicitly multiply opacity of splats
     // by their size, so the splat.w multiplier is omitted here.    
-    return weight/splat.w * color;
+    return weight/scale * color;
   }
 
   vec4 getShadowMapUV() {
@@ -372,8 +389,11 @@ export class NextSplatMaterial extends THREE.ShaderMaterial {
         uniform mat4 projectionMatrix;
         uniform mat4 modelWorldMatrix;
 
+        #include <yuv_rgb>
+        #include <unpack_4x16>
         #include <ray_utils>
         #include <gaussian_utils>
+        #include <pack_pixel_data>
 
         vec3 bvhRayDir;
         struct BVHRay { vec3 origin; } bvhRay;
@@ -431,9 +451,11 @@ export class NextSplatMaterial extends THREE.ShaderMaterial {
             
             rayData.z = abs(rayData.z) + bvhNearest.dist + RAY_STEP*0.5;
             
-            vec2 wc = UNPACK_2x16(rayData.w);
-            wc.y += float(bvhTexLookups)/float(0xFFFF);
-            rayData.w = PACK_2x16(wc);
+            #if SHOW_COST
+              vec2 wc = UNPACK_2x16(rayData.w);
+              wc.y += float(bvhTexLookups)/float(0xFFFF);
+              rayData.w = PACK_2x16(wc);
+            #endif
           }
 
           gl_FragColor = rayData;
@@ -918,13 +940,16 @@ export class CanvasDrawMaterial extends THREE.ShaderMaterial {
           o.rgb *= brightness;
 
           if (monochrome)
-            o.rgb = (vmin3(o.rgb) + vmax3(o.rgb)) * vec3(0.5);
+            o.rgb = o.rgb * RGB_YUV * vec3(1,0,0) * YUV_RGB;
 
           //o.rgb += exp(-o.w) * backgroundRGB;
 
           //drawShadowMap(o);
           drawProgress(o);
-          drawCost(o);
+          
+          #if SHOW_COST
+            drawCost(o);
+          #endif
 
           if (isnan(dot(o, vec4(1))))
             o = vec4(0,1,0,1);

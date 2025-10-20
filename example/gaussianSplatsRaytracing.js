@@ -317,7 +317,7 @@ async function updateBVHMesh() {
   let dx = bbox.max.x - bbox.min.x;
   let dy = bbox.max.y - bbox.min.y;
   let dz = bbox.max.z - bbox.min.z;
-  console.log(dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2));
+  //console.log('AABB:', dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2));
 
   let n = pointCloud.geometry.attributes.position.count;
   let str = n < 1e3 ? n :
