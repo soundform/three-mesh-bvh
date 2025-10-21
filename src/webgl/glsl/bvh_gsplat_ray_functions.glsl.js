@@ -24,7 +24,8 @@ bool _bvhSearchSplats(sampler2D bvh_position, usampler2D bvh_index, sampler2D bv
 		uint nodeId = stack[ ptr-- ];
     vec3 boundsMin = texelFetch1D( bvh_bvhBounds, nodeId * 2u + 0u ).xyz;
     vec3 boundsMax = texelFetch1D( bvh_bvhBounds, nodeId * 2u + 1u ).xyz;
-    bvhTexLookups++;
+
+    bvhTexLookups++; // consider aa+bb as one lookup
 
     if (!bvhVisitBoundingBox(boundsMin, boundsMax))
       continue;
@@ -37,7 +38,7 @@ bool _bvhSearchSplats(sampler2D bvh_position, usampler2D bvh_index, sampler2D bv
 			uint count = boundsInfo.x & 0x0000ffffu;
 			uint offset = boundsInfo.y;
 
-      bvhTexLookups += int(count);
+      bvhTexLookups += int(count); // consider index+splat as one lookup
 
       for (uint id = 0u; id < count; id++) {
         uint splatId = uTexelFetch1D( bvh_index, id + offset ).x / 3u;
@@ -49,13 +50,10 @@ bool _bvhSearchSplats(sampler2D bvh_position, usampler2D bvh_index, sampler2D bv
 			uint leftIndex = nodeId + 1u;
 			uint splitAxis = boundsInfo.x & 0x0000ffffu;
 			uint rightIndex = boundsInfo.y;
-
 			bool leftToRight = bvhRayDir[ splitAxis ] >= 0.0;
-			uint c1 = leftToRight ? leftIndex : rightIndex;
-			uint c2 = leftToRight ? rightIndex : leftIndex;
-
-			stack[ ++ptr ] = c2; // traverse later
-			stack[ ++ptr ] = c1; // traverse first
+			
+      stack[ ++ptr ] = leftToRight ? rightIndex : leftIndex; // traverse later
+			stack[ ++ptr ] = leftToRight ? leftIndex : rightIndex; // traverse first
 		}
 	}
 

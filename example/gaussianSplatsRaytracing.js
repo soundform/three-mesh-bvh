@@ -18,8 +18,11 @@ import {
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 
+const dpr = window.devicePixelRatio;
+
 const params = {
   open: () => loadSceneFile(),
+  //size: () => [3840/dpr, 2160/dpr],
   //size: () => [16 * 150, 16 * 150],
   size: () => [window.innerWidth, window.innerHeight],
 
@@ -37,6 +40,7 @@ const params = {
   rayStep: -2.0, // exp10
   fogDensity: -3.0, // exp10
   shadows: false,
+  cost: true,
   monochrome: false,
   lightPos: new THREE.Vector3(1e3, 2e3, 3e3),
   shadowMapLayers: 16,
@@ -63,6 +67,7 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
 
   updateDefines(params) {
     this.defines.BVH_STACK_DEPTH = params.maxDepth;
+    this.defines.SHOW_COST = +params.cost;
     this.needsUpdate = true;
   }
 
@@ -469,6 +474,7 @@ function rebuildGUI() {
 
   pointsFolder.add(params, 'maxDepth', 4, 64, 1).onChange(() => {
     gisplat.updateDefines();
+    raytracingPass.material.updateDefines(params);
     updateBVHMesh();
   });
   pointsFolder.add(params, 'sparsity', 0, 16, 1).onChange(() => {
@@ -510,6 +516,10 @@ function rebuildGUI() {
     });
     displayFolder.add(params, 'brightness', -3, 3, 0.5);
     displayFolder.add(params, 'monochrome');
+    displayFolder.add(params, 'cost').onChange(() => {
+      gisplat.updateDefines();
+      raytracingPass.material.updateDefines(params);
+    });
   }
 }
 

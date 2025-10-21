@@ -41,8 +41,6 @@ THREE.ShaderChunk['unpack_4x16'] = /* glsl */`
 
 // (RGBA=0..1, zDepth=0..INF, cost=0..65535) <-> 4 x float32
 THREE.ShaderChunk['pack_pixel_data'] = /* glsl */`
-  #define SHOW_COST 1
-
   struct PixelData { 
     vec4 color; // .w < 1.0 - the accumulated density
     float zDepth; 
@@ -304,6 +302,7 @@ class NextSplatMaterial extends THREE.ShaderMaterial {
   updateDefines(params) {
     this.defines.BVH_STACK_DEPTH = params.maxDepth;
     this.defines.RAY_STEP = 10 ** params.rayStep;
+    this.defines.SHOW_COST = +params.cost;
     this.needsUpdate = true;
   }
 
@@ -315,6 +314,7 @@ class NextSplatMaterial extends THREE.ShaderMaterial {
 
         RAY_STEP: 0.001,
         BVH_STACK_DEPTH: 64,
+        SHOW_COST: 1,
 
       },
 
@@ -438,6 +438,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
     this.defines.BVH_STACK_DEPTH = params.maxDepth;
     this.defines.RAY_STEP = 10 ** params.rayStep;
     this.defines.NEED_SHADOW = +params.shadows;
+    this.defines.SHOW_COST = +params.cost;
     this.needsUpdate = true;
   }
 
@@ -452,6 +453,7 @@ class RaymarchingMaterial extends THREE.ShaderMaterial {
         INTEGRATE_FOG: 256,
         NEED_SHADOW: 1,
         NEED_COLOR: 1,
+        SHOW_COST: 1,
 
       },
 
@@ -817,8 +819,19 @@ class SplatColorsMaterial extends THREE.ShaderMaterial {
 }
 
 class CanvasDrawMaterial extends THREE.ShaderMaterial {
+
+  updateDefines(params) {
+    this.defines.SHOW_COST = +params.cost;
+    this.needsUpdate = true;
+  }
+
   constructor() {
     super({
+
+      defines: {
+        SHOW_COST: 1,
+      },
+      
       uniforms: {
         brightness: { value: 1 },
         monochrome: { value: false },
@@ -996,15 +1009,16 @@ export class GISplatRenderer {
       this.nextSplatPass.material.updateDefines(params);
     }
 
-    if (this.raymarchingPass) {
-      this.raymarchingPass.material.updateDefines(params);
-    }
+    this.raymarchingPass.material.updateDefines(params);
+    this.canvasDrawPass.material.updateDefines(params);
   }
 
   clear() {
-    let [w, h] = this.params.size();
-    this.pixelsRT.setSize(w, h);
+    let size = new THREE.Vector2();
+    this.renderer.getDrawingBufferSize(size);
+    this.pixelsRT.setSize(size.x, size.y);
     this.frameId = 0;
+    //console.log('render size:', size.x, 'x', size.y);
   }
 
   render() {
