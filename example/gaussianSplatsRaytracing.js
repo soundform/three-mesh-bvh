@@ -2,9 +2,11 @@ import * as THREE from 'three';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
-import Stats from 'stats.js';
+import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
+import { GISplatRenderer } from './GISplatRenderer.js';
+import Stats from 'stats.js';
 
 import {
   computeBoundsTree, disposeBoundsTree,
@@ -48,28 +50,12 @@ const params = {
   },
 };
 
-import {
-  GSplatsDataUniformStruct,
-  DoubleBufferRenderTarget,
-  loadPLY,
-  getSunMatrix4,
-  updateBVH,
-  disposeBVH,
-  updateSplatColors,
-  updateShadowMapGI,
-  runRaymarchingPass,
-  runRenderPass,
-  updateShaderDefines,
-} from './GISplatRenderer.js';
-
-let renderer, camera, scene, orbit, gui, stats, outputContainer;
-let bvh, pointCloud, raytracingPass;
-let pixelsRT = new DoubleBufferRenderTarget();
-let frameId = 0;
-
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/point-cloud-porsche/scene.ply';
 //const sceneFile = 'https://raw.githubusercontent.com/gkjohnson/3d-demo-data/main/models/stanford-bunny/bunny.glb';
 const sceneFile = 'models/soundform.ply';
+
+let renderer, camera, scene, orbit, gui, stats, outputContainer;
+let gisplat, pointCloud, raytracingPass;
 
 // Finds the nearest 8 splats, blends them, then repeats the same at the next frame.
 // In practice, it's usually better to use a proper rasterizer: https://sparkjs.dev.
@@ -78,6 +64,25 @@ class RaytracingMaterial extends THREE.ShaderMaterial {
   updateDefines(params) {
     this.defines.BVH_STACK_DEPTH = params.maxDepth;
     this.needsUpdate = true;
+  }
+
+  static render() {
+    let gsd = gisplat.gsd;
+    let u = raytracingPass.material.uniforms;
+
+    u.bvh.value.updateFrom(gisplat.bvh);
+    u.frameId.value = gisplat.frameId;
+    u.cameraWorldMatrix.value.copy(camera.matrixWorld);
+    u.projectionMatrix.value.copy(camera.projectionMatrix);
+    u.modelWorldMatrix.value.copy(pointCloud.matrixWorld);
+    u.pixelData.value = gisplat.pixelsRT.rtA.texture;
+    u.gsd.value = gsd;
+
+    renderer.setRenderTarget(gisplat.pixelsRT.rtB);
+    raytracingPass.render(renderer);
+    gisplat.pixelsRT.swap();
+
+    gisplat.runRenderPass();
   }
 
   constructor() {
@@ -310,14 +315,7 @@ async function updateBVHMesh() {
   outputContainer.textContent = 'Updating BVH...';
   await sleep(0);
 
-  bvh = updateBVH(params, pointCloud, scene);
-
-  let bbox = new THREE.Box3();
-  bvh.getBoundingBox(bbox);
-  let dx = bbox.max.x - bbox.min.x;
-  let dy = bbox.max.y - bbox.min.y;
-  let dz = bbox.max.z - bbox.min.z;
-  //console.log('AABB:', dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2));
+  gisplat.updateBVH();
 
   let n = pointCloud.geometry.attributes.position.count;
   let str = n < 1e3 ? n :
@@ -332,8 +330,7 @@ async function updateShadowMap() {
   if (!params.shadows)
     return;
 
-  let gsd = new GSplatsDataUniformStruct(params);
-  updateShadowMapGI(renderer, params, bvh, gsd, pointCloud);
+  gisplat.updateShadowMap();
   clearRenderTargets();
 }
 
@@ -347,9 +344,7 @@ function updateRenderSize() {
 }
 
 function clearRenderTargets() {
-  let [w, h] = params.size();
-  pixelsRT.setSize(w, h);
-  frameId = 0;
+  gisplat?.clear();
 }
 
 async function loadSceneFile() {
@@ -362,7 +357,7 @@ async function loadSceneFile() {
     input.onchange = () => resolve(input.files[0]));
   if (!blob) return;
 
-  frameId = -1;
+  gisplat.frameId = -1;
 
   console.log('Opening file:', (blob.size / 1e6).toFixed(1), 'MB', blob.name);
   let url = URL.createObjectURL(blob);
@@ -385,6 +380,21 @@ async function loadGeometry(url, filename = url) {
   return geometry;
 }
 
+async function loadPLY(url) {
+  let ply = new PLYLoader();
+
+  // these will go to geometry.attributes
+  ply.setCustomPropertyNameMapping({
+    scale: ['scale_0', 'scale_1', 'scale_2'], // scale = log(S)
+    f_dc: ['f_dc_0', 'f_dc_1', 'f_dc_2'], // f_dc = (RGB - 0.5)*sqrt(PI)*2.0
+    rgb: ['red', 'green', 'blue'], // 0..255
+    opacity: ['opacity'], // opacity = -log(1.0/A - 1.0), A=0..1
+    // rot: ['rot_0', 'rot_1', 'rot_2', 'rot_3'], // quaternion rotation
+  });
+
+  return await ply.loadAsync(url);
+}
+
 async function loadGLTF(url) {
   let gltf = await new GLTFLoader()
     .setMeshoptDecoder(MeshoptDecoder)
@@ -394,9 +404,21 @@ async function loadGLTF(url) {
   return gltfMesh.geometry;
 }
 
-async function initGeometry(url = sceneFile, filename) {
-  disposeBVH();
+function getSunMatrix4(zAxis) {
+  let c = zAxis.clone().normalize();
+  let b = Math.abs(c.x) > Math.abs(c.z) ?
+    new THREE.Vector3(-c.y, c.x, 0).normalize() :
+    new THREE.Vector3(0, -c.z, c.y).normalize();
+  let a = c.clone().cross(b);
 
+  return new THREE.Matrix4(
+    a.x, a.y, a.z, 0,
+    b.x, b.y, b.z, 0,
+    c.x, c.y, c.z, 0,
+    0, 0, 0, 1);
+}
+
+async function initGeometry(url = sceneFile, filename) {
   const geometry = await loadGeometry(url, filename);
   const material = new THREE.PointsMaterial({ color: 0xCCCCCC });
   scene.remove(pointCloud);
@@ -410,7 +432,10 @@ async function initGeometry(url = sceneFile, filename) {
   pointCloud.matrixAutoUpdate = false;
   pointCloud.updateMatrixWorld();
 
-  await updateSplatColors(renderer, pointCloud);
+  gisplat?.dispose();
+  gisplat = new GISplatRenderer({ renderer, camera, scene, params, pointCloud });
+
+  await gisplat.updateSplatColors();
   await updateBVHMesh();
 }
 
@@ -431,7 +456,7 @@ function rebuildGUI() {
   const pointsFolder = gui.addFolder('points');
 
   pointsFolder.add(params, 'maxDepth', 4, 64, 1).onChange(() => {
-    updateShaderDefines(params);
+    gisplat.updateDefines();
     updateBVHMesh();
   });
   pointsFolder.add(params, 'sparsity', 0, 16, 1).onChange(() => {
@@ -446,14 +471,14 @@ function rebuildGUI() {
 
   if (params.mode === 'raymarching') {
     displayFolder.add(params, 'rayStep', -3, -1, 0.5).onChange(() => {
-      updateShaderDefines(params);
+      gisplat.updateDefines();
     });
     displayFolder.add(params, 'fogDensity', -3.0, 7.5, 0.25).onChange(() => {
       updateShadowMap();
     });
     displayFolder.add(params, 'ambientLight', -10, -1, 0.5);
     displayFolder.add(params, 'shadows').onChange(() => {
-      updateShaderDefines(params, 'shadows');
+      gisplat.updateDefines('shadows');
       updateShadowMap();
     });
     displayFolder.add(params, 'shadowMapLayers', 1, 32, 1).onChange(() => {
@@ -476,11 +501,11 @@ function rebuildGUI() {
   }
 }
 
-function render() {
+function renderFrame() {
 
-  requestAnimationFrame(render);
+  requestAnimationFrame(renderFrame);
 
-  if (frameId < 0 || !params.render)
+  if (!gisplat || gisplat.frameId < 0 || !params.render)
     return;
 
   stats.update();
@@ -493,34 +518,18 @@ function render() {
     renderer.render(scene, camera);
 
   } else if (params.mode === 'raytracing' || params.mode == 'raymarching') {
-    if (!bvh) return;
+    if (!gisplat.bvh) return;
 
     camera.updateMatrixWorld();
     pointCloud.updateMatrixWorld();
 
-    if (params.mode == 'raytracing') {
-      let gsd = new GSplatsDataUniformStruct(params);
-      let u = raytracingPass.material.uniforms;
-      u.bvh.value.updateFrom(bvh);
-      u.frameId.value = frameId;
-      u.cameraWorldMatrix.value.copy(camera.matrixWorld);
-      u.projectionMatrix.value.copy(camera.projectionMatrix);
-      u.modelWorldMatrix.value.copy(pointCloud.matrixWorld);
-      u.pixelData.value = pixelsRT.rtA.texture;
-      u.gsd.value = gsd;
-      renderer.setRenderTarget(pixelsRT.rtB);
-      raytracingPass.render(renderer);
-      pixelsRT.swap();
-    }
+    if (params.mode == 'raytracing')
+      RaytracingMaterial.render();
 
-    if (params.mode == 'raymarching') {
-      runRaymarchingPass(renderer, camera, pointCloud, params, frameId, pixelsRT);
-    }
-
-    runRenderPass(renderer, params, frameId, pixelsRT.rtA);
-    frameId++;
+    if (params.mode == 'raymarching')
+      gisplat.render();
   }
 }
 
 init();
-render();
+renderFrame();
