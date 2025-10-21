@@ -38,7 +38,7 @@ const params = {
   fogDensity: -3.0, // exp10
   shadows: false,
   monochrome: false,
-  lightPos: new THREE.Vector3(8e3, 1e3, 9e3),
+  lightPos: new THREE.Vector3(1e3, 2e3, 3e3),
   shadowMapLayers: 16,
 
   get bvhOptions() {
@@ -315,7 +315,15 @@ async function updateBVHMesh() {
   outputContainer.textContent = 'Updating BVH...';
   await sleep(0);
 
+  console.time('updateBVH');
   gisplat.updateBVH();
+  console.timeEnd('updateBVH');
+
+  let bbox = gisplat.boundingBox;
+  let dx = bbox.max.x - bbox.min.x;
+  let dy = bbox.max.y - bbox.min.y;
+  let dz = bbox.max.z - bbox.min.z;
+  console.log('AABB:', dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2));
 
   let n = pointCloud.geometry.attributes.position.count;
   let str = n < 1e3 ? n :
@@ -330,7 +338,11 @@ async function updateShadowMap() {
   if (!params.shadows)
     return;
 
+  console.time('Update shadowMap');
   gisplat.updateShadowMap();
+  gisplat.fetchShadowMap();
+  console.timeEnd('Update shadowMap');
+
   clearRenderTargets();
 }
 

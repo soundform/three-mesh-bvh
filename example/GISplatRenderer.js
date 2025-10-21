@@ -950,6 +950,11 @@ class DoubleBufferRenderTarget {
     this.rtA.setSize(w, h);
     this.rtB.setSize(w, h);
   }
+
+  dispose() {
+    this.rtA.dispose();
+    this.rtB.dispose();
+  }
 }
 
 export class GISplatRenderer {
@@ -978,6 +983,12 @@ export class GISplatRenderer {
 
   get gsd() {
     return new GSplatsDataUniformStruct(this.params, this.bvhGeometry, this.splatColorsRT, this.shadowMapRT);
+  }
+
+  get boundingBox() {
+    let bbox = new THREE.Box3();
+    this.bvh.getBoundingBox(bbox);
+    return bbox;
   }
 
   updateDefines(name = null) {
@@ -1051,8 +1062,6 @@ export class GISplatRenderer {
   }
 
   updateBVH() {
-    console.time('updateBVH');
-
     let scene = this.scene;
     let params = this.params;
     let pointCloud = this.pointCloud;
@@ -1144,15 +1153,6 @@ export class GISplatRenderer {
     // so build the BVH first, and then replace the position attr, as MeshBVH no longer needs it.
     bvhGeometry.attributes.position.copy(position4);
     position3 = null; // it's been replaced with position4
-
-    let bbox = new THREE.Box3();
-    this.bvh.getBoundingBox(bbox);
-    let dx = bbox.max.x - bbox.min.x;
-    let dy = bbox.max.y - bbox.min.y;
-    let dz = bbox.max.z - bbox.min.z;
-    //console.log('AABB:', dx.toFixed(2) + ' x ' + dy.toFixed(2) + ' x ' + dz.toFixed(2));
-
-    console.timeEnd('updateBVH');
   }
 
   updateSplatColors() {
@@ -1189,7 +1189,6 @@ export class GISplatRenderer {
   }
 
   updateShadowMap() {
-    console.time('Update shadowMap');
     let renderer = this.renderer;
     let params = this.params;
     let pointCloud = this.pointCloud;
@@ -1229,18 +1228,21 @@ export class GISplatRenderer {
     shadowMapPass.dispose();
     layerRT.dispose();
     copy.dispose();
+  }
 
+  fetchShadowMap(rgba = new Uint8Array(4)) {
     // Read data to CPU to measure time correctly.
     // This wouldn't work with a 3D texture.
-    renderer.readRenderTargetPixels(shadowMapRT,
-      0, 0, 1, 1, new Uint8Array(4), 0);
-    renderer.setRenderTarget(null);
-    console.timeEnd('Update shadowMap');
+    this.renderer.setRenderTarget(this.shadowMapRT, 0);
+    this.renderer.readRenderTargetPixels(this.shadowMapRT, 0, 0, 1, 1, rgba, 0);
   }
 
   dispose() {
     this.bvh = null;
     this.bvhGeometry = null;
     this.scene.remove(this.bvhHelper);
+    this.shadowMapRT.dispose();
+    this.splatColorsRT.dispose();
+    this.pixelsRT.dispose();
   }
 }
